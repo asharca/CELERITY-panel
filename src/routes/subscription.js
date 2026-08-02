@@ -21,7 +21,11 @@ const clashTemplateService = require('../services/clashTemplateService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
-const { getSubscriptionTitle, getSubscriptionContentDisposition } = require('../utils/subscriptionTitle');
+const {
+    getSubscriptionTitle,
+    getSubscriptionResponseTitle,
+    getSubscriptionContentDisposition,
+} = require('../utils/subscriptionTitle');
 const { formatTraffic } = require('../utils/formatTraffic');
 const { getDateLocale, normalizeLanguage } = require('../middleware/i18n');
 const uaStats = require('../services/uaStatsService');
@@ -2624,14 +2628,14 @@ function sendFakeSubscription(res, user, format, userAgent, settings, remark, fa
     const lines = parseRemarkLines(remark, fallback);
     const data = {
         content: generateFakeSubscriptionContent(format, lines),
-        profileTitle: (titleOverride || '').trim() || getSubscriptionTitle(user),
+        profileTitle: (titleOverride || '').trim() || getSubscriptionTitle(user, format),
         username: user.username || user.userId,
         traffic: { tx: user.traffic?.tx || 0, rx: user.traffic?.rx || 0 },
         trafficLimit: user.trafficLimit || 0,
         expireAt: user.expireAt,
     };
     res.set('Cache-Control', 'no-store');
-    sendCachedSubscription(res, data, format, userAgent, settings, extraHeaders);
+    sendCachedSubscription(res, data, format, userAgent, settings, extraHeaders, { preserveProfileTitle: true });
 }
 
 // Default fake-location names per invalid reason, used only when the admin
@@ -2994,7 +2998,7 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
     return {
         content,
         contentFormat: effectiveFormat,
-        profileTitle: getSubscriptionTitle(user),
+        profileTitle: getSubscriptionTitle(user, effectiveFormat),
         username: user.username || user.userId,
         traffic: {
             tx: user.traffic?.tx || 0,
@@ -3008,12 +3012,15 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
 /**
  * Send cached subscription response
  */
-function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtraHeaders = null) {
+function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtraHeaders = null, options = {}) {
     // contentFormat reflects what's actually in `data.content` and may differ
     // from the requested `format` when we transparently upgrade the response
     // (HAPP UA + virtual node → xray-json). Falls back to `format` for legacy
     // cache entries written before this field existed.
     const effectiveFormat = data.contentFormat || format;
+    const profileTitle = options.preserveProfileTitle
+        ? data.profileTitle
+        : getSubscriptionResponseTitle(data.profileTitle, effectiveFormat);
     let contentType = 'text/plain';
 
     switch (effectiveFormat) {
@@ -3031,8 +3038,8 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
     
     const headers = {
         'Content-Type': `${contentType}; charset=utf-8`,
-        'Content-Disposition': getSubscriptionContentDisposition(data.profileTitle),
-        'Profile-Title': encodeTitle(data.profileTitle),
+        'Content-Disposition': getSubscriptionContentDisposition(profileTitle),
+        'Profile-Title': encodeTitle(profileTitle),
         'Profile-Update-Interval': String(settings?.subscription?.updateInterval || 12),
         'Subscription-Userinfo': [
             `upload=${data.traffic.tx}`,

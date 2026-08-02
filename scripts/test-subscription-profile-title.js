@@ -3,6 +3,7 @@ const assert = require('assert');
 const {
     DEFAULT_SUBSCRIPTION_TITLE,
     getSubscriptionTitle,
+    getSubscriptionResponseTitle,
     getSubscriptionContentDisposition,
 } = require('../src/utils/subscriptionTitle');
 
@@ -12,14 +13,24 @@ assert.strictEqual(
     'an internal group name must not become the subscription profile title'
 );
 assert.strictEqual(
-    getSubscriptionTitle({ groups: [{ subscriptionTitle: '  My VPN  ' }] }),
+    getSubscriptionTitle({ groups: [{ subscriptionTitle: '备用节点-电信线路' }] }, 'clash'),
+    DEFAULT_SUBSCRIPTION_TITLE,
+    'a group-specific title must not override the Clash import name'
+);
+assert.strictEqual(
+    getSubscriptionTitle({ groups: [{ subscriptionTitle: '  My VPN  ' }] }, 'uri'),
     'My VPN',
-    'a group-specific profile title remains configurable'
+    'a group-specific title remains available to non-Clash clients'
 );
 assert.strictEqual(
     getSubscriptionTitle({ groups: [] }),
     DEFAULT_SUBSCRIPTION_TITLE,
     'users without a group receive the branded profile title'
+);
+assert.strictEqual(
+    getSubscriptionResponseTitle('备用节点-电信线路', 'clash'),
+    DEFAULT_SUBSCRIPTION_TITLE,
+    'a cached Clash subscription must not restore a legacy group title'
 );
 
 const defaultDisposition = getSubscriptionContentDisposition(DEFAULT_SUBSCRIPTION_TITLE);

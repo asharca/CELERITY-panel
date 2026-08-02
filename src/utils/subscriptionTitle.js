@@ -7,21 +7,43 @@
  */
 
 const DEFAULT_SUBSCRIPTION_TITLE = 'renhedata-vpn';
+const CLASH_SUBSCRIPTION_FORMATS = new Set(['clash', 'yaml']);
+
+function isClashSubscriptionFormat(format) {
+    return CLASH_SUBSCRIPTION_FORMATS.has(String(format || '').toLowerCase());
+}
 
 /**
  * Return the profile title for a user's subscription.
  *
- * A group may opt in to a custom title through `subscriptionTitle`. When it
- * is empty, retain the product name instead of falling back to the group name.
+ * Clash imports always use the product name. Other subscription clients may
+ * opt in to a group-specific title through `subscriptionTitle`.
  *
  * @param {{ groups?: Array<{ subscriptionTitle?: string }> }} user
+ * @param {string} [format]
  * @returns {string}
  */
-function getSubscriptionTitle(user) {
+function getSubscriptionTitle(user, format) {
+    if (isClashSubscriptionFormat(format)) return DEFAULT_SUBSCRIPTION_TITLE;
+
     const title = user?.groups?.[0]?.subscriptionTitle;
     return typeof title === 'string' && title.trim()
         ? title.trim()
         : DEFAULT_SUBSCRIPTION_TITLE;
+}
+
+/**
+ * Resolve the title to send for an already-cached subscription response.
+ * This keeps legacy cache entries from restoring an old group name in Clash.
+ *
+ * @param {string} profileTitle
+ * @param {string} [format]
+ * @returns {string}
+ */
+function getSubscriptionResponseTitle(profileTitle, format) {
+    return isClashSubscriptionFormat(format)
+        ? DEFAULT_SUBSCRIPTION_TITLE
+        : String(profileTitle || DEFAULT_SUBSCRIPTION_TITLE).trim() || DEFAULT_SUBSCRIPTION_TITLE;
 }
 
 /**
@@ -54,5 +76,6 @@ function getSubscriptionContentDisposition(profileTitle) {
 module.exports = {
     DEFAULT_SUBSCRIPTION_TITLE,
     getSubscriptionTitle,
+    getSubscriptionResponseTitle,
     getSubscriptionContentDisposition,
 };
