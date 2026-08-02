@@ -98,6 +98,7 @@ const manageNodeSchema = z.object({
         sni: z.string().optional(),
         port: z.number().optional(),
         portRange: z.string().optional().describe('UDP port-hopping range; omit or pass an empty string to disable'),
+        statsHost: z.string().optional().describe('Panel-side host for Hysteria stats requests; empty uses the public node IP'),
         type: z.enum(['hysteria', 'xray', 'virtual']).optional().describe('Node type. "virtual" is a load-balancer entry (HAPP/Xray-core balancer + Singbox/Clash url-test/load-balance group) without its own remote server'),
         groups: z.array(z.string()).optional(),
         active: z.boolean().optional(),
@@ -361,6 +362,7 @@ async function manageNode(args, emit) {
                 sni: data.sni || '',
                 port: data.port || 443,
                 portRange: normalizedPortRange,
+                statsHost: typeof data.statsHost === 'string' ? data.statsHost.trim() : '',
                 statsPort: 9999,
                 statsSecret,
                 groups: data.groups || [],
@@ -417,7 +419,7 @@ async function manageNode(args, emit) {
         case 'update': {
             if (!id) throw new Error('id is required for update');
             const allowed = [
-                'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
+                'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsHost', 'statsPort', 'groups', 'ssh', 'paths',
                 'settings', 'active', 'rankingCoefficient', 'country', 'comment', 'cascadeRole', 'type',
                 'virtual',
                 'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -438,6 +440,8 @@ async function manageNode(args, emit) {
                     } catch (error) {
                         return { error: error.message, code: 400 };
                     }
+                } else if (k === 'statsHost') {
+                    updates[k] = typeof data[k] === 'string' ? data[k].trim() : '';
                 } else {
                     updates[k] = data[k];
                 }

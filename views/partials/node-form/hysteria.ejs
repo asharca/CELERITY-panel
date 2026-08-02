@@ -4,9 +4,17 @@
                 <small class="section-hint"><%- renderDocsIcon('stats') %><%= t('nodes.sectionStatsHint') %></small>
                 <div class="form-row">
                     <div class="form-group">
+                        <label for="statsHost"><%= t('nodes.statsHost') %></label>
+                        <input type="text" id="statsHost" name="statsHost" value="<%= node?.statsHost || '' %>"
+                               placeholder="10.0.0.10">
+                        <small><%= t('nodes.statsHostHint') %></small>
+                    </div>
+                    <div class="form-group">
                         <label for="statsPort"><%= t('nodes.statsPort') %></label>
                         <input type="number" id="statsPort" name="statsPort" value="<%= node?.statsPort || 9999 %>">
                     </div>
+                </div>
+                <div class="form-row">
                     <div class="form-group">
                         <label for="statsSecret"><%= t('nodes.statsSecret') %></label>
                         <div class="input-with-button">

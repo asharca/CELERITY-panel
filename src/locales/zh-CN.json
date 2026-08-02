@@ -271,6 +271,8 @@
     "port": "主端口",
     "portRange": "端口跳跃范围",
     "portRangeHint": "留空则关闭端口跳跃；填写后客户端将连接这些端口",
+    "statsHost": "统计管理地址",
+    "statsHostHint": "可选，仅供面板访问统计 API；留空使用节点 IP，不会发布到订阅。",
     "statsPort": "统计 API 端口",
     "statsSecret": "API 密钥",
     "sectionStatsApi": "统计 API",

@@ -271,6 +271,8 @@
     "port": "Main Port",
     "portRange": "Port Hopping Range",
     "portRangeHint": "Leave empty to disable port hopping; otherwise clients will connect to these ports",
+    "statsHost": "Stats Management Host",
+    "statsHostHint": "Optional panel-side address for the Stats API. Leave empty to use the node IP; it is never published to subscriptions.",
     "statsPort": "Stats API Port",
     "statsSecret": "API Secret",
     "sectionStatsApi": "Stats API",

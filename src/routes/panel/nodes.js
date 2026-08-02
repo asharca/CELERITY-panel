@@ -360,6 +360,7 @@ router.post('/nodes', async (req, res) => {
             flag: req.body.flag || '',
             port: parseInt(req.body.port) || 443,
             portRange: canonicalizePortRange(req.body.portRange),
+            statsHost: typeof req.body.statsHost === 'string' ? req.body.statsHost.trim() : '',
             statsPort: parseInt(req.body.statsPort) || 9999,
             statsSecret,
             groups,
@@ -634,6 +635,7 @@ router.post('/nodes/:id', async (req, res) => {
             sni: req.body.sni || '',
             port: parseInt(req.body.port) || 443,
             portRange: canonicalizePortRange(req.body.portRange),
+            statsHost: typeof req.body.statsHost === 'string' ? req.body.statsHost.trim() : '',
             statsPort: parseInt(req.body.statsPort) || 9999,
             groups,
             maxOnlineUsers: parseInt(req.body.maxOnlineUsers) || 0,
@@ -712,9 +714,15 @@ router.post('/nodes/:id', async (req, res) => {
 
         // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
         existingNode.set(updates);
+        // Capture Mongoose's actual changes before save() resets modifiedPaths.
+        // This prevents panel-only fields such as statsHost from causing a
+        // remote Hysteria config push when no runtime setting changed.
+        const changedUpdates = Object.fromEntries(
+            existingNode.modifiedPaths().map(changedPath => [changedPath, true])
+        );
         await existingNode.save();
 
-        syncService.schedulePush(nodeId, updates, {
+        syncService.schedulePush(nodeId, changedUpdates, {
             previousPortRange,
             previousPort,
             previousType,

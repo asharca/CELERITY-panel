@@ -245,7 +245,7 @@ router.post('/:id/disable', requireScope('nodes:write'), (req, res) => setNodeAc
 router.post('/', requireScope('nodes:write'), async (req, res) => {
     try {
         const {
-            name, ip, domain, sni, port, portRange, statsPort,
+            name, ip, domain, sni, port, portRange, statsHost, statsPort,
             groups, ssh, paths, settings, rankingCoefficient,
             type, xray, virtual, cascadeRole, country, comment,
             hopInterval, acme, masquerade, bandwidth,
@@ -322,6 +322,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             sni: sni || '',
             port: port || 443,
             portRange: normalizedPortRange,
+            statsHost: typeof statsHost === 'string' ? statsHost.trim() : '',
             statsPort: statsPort || 9999,
             statsSecret,
             groups: groups || [],
@@ -387,7 +388,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
         const allowedUpdates = [
-            'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort',
+            'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsHost', 'statsPort',
             'groups', 'ssh', 'paths', 'settings', 'active', 'rankingCoefficient',
             'type', 'xray', 'virtual', 'cascadeRole', 'country', 'comment',
             'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -411,6 +412,8 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                     } catch (error) {
                         return res.status(400).json({ error: error.message });
                     }
+                } else if (key === 'statsHost') {
+                    updates[key] = typeof req.body[key] === 'string' ? req.body[key].trim() : '';
                 } else {
                     updates[key] = req.body[key];
                 }

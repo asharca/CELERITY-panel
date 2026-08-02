@@ -271,6 +271,8 @@
     "port": "Основной порт",
     "portRange": "Port Hopping диапазон",
     "portRangeHint": "Оставьте пустым, чтобы отключить Port Hopping; иначе клиенты будут подключаться к этим портам",
+    "statsHost": "Адрес управления статистикой",
+    "statsHostHint": "Необязательный адрес Stats API для панели. Если пусто, используется IP ноды; в подписки не публикуется.",
     "statsPort": "Порт API",
     "statsSecret": "Секрет API",
     "sectionStatsApi": "Stats API",

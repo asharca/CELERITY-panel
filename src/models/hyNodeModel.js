@@ -328,6 +328,10 @@ const hyNodeSchema = new mongoose.Schema({
     quic: { type: quicSchema, default: () => ({}) },
     resolver: { type: resolverSchema, default: () => ({}) },
     acl: { type: aclSettingsSchema, default: () => ({}) },
+    // Optional panel-side route to the Hysteria traffic API. This may differ
+    // from the public subscription address when the stats port is reachable
+    // only through a management network. Empty means use `ip`.
+    statsHost: { type: String, default: '', trim: true },
     statsPort: { type: Number, default: 9999 },
     statsSecret: { type: String, default: '' },
 

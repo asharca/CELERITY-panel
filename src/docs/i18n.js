@@ -479,6 +479,8 @@ JSON-эндпоинты возвращают ошибки в таком форм
             'Main service port.': 'Основной порт сервиса.',
             'UDP port hopping range.': 'Диапазон UDP port hopping.',
             'Hysteria stats API port.': 'Порт Hysteria Stats API.',
+            'Panel-side management host for Hysteria stats requests. Empty or omitted uses `ip`; never published to subscriptions.': 'Адрес управления Hysteria Stats API со стороны панели. Если поле пусто или не передано, используется `ip`; в подписки не публикуется.',
+            'Panel-side management host for Hysteria stats requests. Empty uses `ip`; never published to subscriptions.': 'Адрес управления Hysteria Stats API со стороны панели. Если поле пусто, используется `ip`; в подписки не публикуется.',
             'Server group ObjectIds.': 'ObjectId групп серверов.',
             '0 = unlimited.': '0 = без лимита.',
             'SSH credentials. Password or privateKey can be provided.': 'SSH-данные. Можно передать password или privateKey.',

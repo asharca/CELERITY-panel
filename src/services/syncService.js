@@ -42,6 +42,8 @@ const HEALTH_FAILURE_THRESHOLD = 3;
 const CONFIG_AFFECTING_FIELDS = new Set([
     // Shared
     'type', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'statsSecret', 'active',
+    // statsHost is intentionally excluded: it changes only how the panel
+    // reaches the Stats API and is never part of the remote runtime config.
     'useCustomConfig', 'customConfig',
     // Hysteria
     'obfs', 'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -84,6 +86,14 @@ function hasConfigRelevantUpdates(updates) {
         const root = k.split('.')[0];
         return CONFIG_AFFECTING_FIELDS.has(k) || CONFIG_AFFECTING_FIELDS.has(root);
     });
+}
+
+// Hysteria's public subscription address and its panel-side management route
+// can differ (for example, public NAT plus a private stats network). Keep this
+// routing decision local to stats calls so it never leaks into generated node
+// config or subscriptions.
+function getHysteriaStatsHost(node) {
+    return String(node?.statsHost || '').trim() || node?.ip;
 }
 
 /**
@@ -1189,7 +1199,8 @@ class SyncService {
                 return;
             }
             
-            const url = `http://${node.ip}:${node.statsPort}/traffic?clear=true`;
+            const statsHost = getHysteriaStatsHost(node);
+            const url = `http://${statsHost}:${node.statsPort}/traffic?clear=true`;
             
             const response = await axios.get(url, {
                 headers: { Authorization: node.statsSecret },
@@ -1281,7 +1292,8 @@ class SyncService {
                 return 0;
             }
             
-            const url = `http://${node.ip}:${node.statsPort}/online`;
+            const statsHost = getHysteriaStatsHost(node);
+            const url = `http://${statsHost}:${node.statsPort}/online`;
             
             const response = await axios.get(url, {
                 headers: { Authorization: node.statsSecret },
@@ -1331,7 +1343,7 @@ class SyncService {
      * Kick user from all nodes
      */
     async kickUser(userId) {
-        const user = await HyUser.findOne({ userId }).populate('nodes', 'name type ip statsPort statsSecret');
+        const user = await HyUser.findOne({ userId }).populate('nodes', 'name type ip statsHost statsPort statsSecret');
         
         if (!user) {
             return;
@@ -1341,9 +1353,10 @@ class SyncService {
             try {
                 // Virtual nodes have no remote service to kick from.
                 if (node.type === 'virtual') continue;
-                if (!node.statsPort || !node.statsSecret || !node.ip) continue;
+                const statsHost = getHysteriaStatsHost(node);
+                if (!node.statsPort || !node.statsSecret || !statsHost) continue;
 
-                const url = `http://${node.ip}:${node.statsPort}/kick`;
+                const url = `http://${statsHost}:${node.statsPort}/kick`;
                 
                 await axios.post(url, [userId], {
                     headers: {
