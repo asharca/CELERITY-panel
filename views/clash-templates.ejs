@@ -1,0 +1,203 @@
+<%
+const editor = editingTemplate || {};
+const isEditing = Boolean(editor._id);
+const formAction = isEditing ? `/panel/clash-templates/${editor._id}` : '/panel/clash-templates';
+const starterYaml = `port: 7890
+socks-port: 7891
+mixed-port: 7892
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: info
+ipv6: true
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - __CELERITY_PROXIES__
+
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY`;
+%>
+
+<div class="page-header clash-template-heading">
+    <div>
+        <h1><%= t('clashTemplates.title') %></h1>
+        <p class="hint"><%= t('clashTemplates.pageHint') %></p>
+    </div>
+    <% if (isEditing) { %>
+        <a href="/panel/clash-templates" class="btn"><i class="ti ti-plus"></i> <%= t('clashTemplates.newTemplate') %></a>
+    <% } %>
+</div>
+
+<% if (error) { %>
+    <div class="alert alert-danger"><strong><%= t('common.error') %>:</strong> <%= error %></div>
+<% } %>
+<% if (notice) { %>
+    <div class="alert alert-success"><%= t(`clashTemplates.${notice}`) %></div>
+<% } %>
+
+<div class="card">
+    <div class="card-header">
+        <h2><i class="ti ti-file-code"></i> <%= isEditing ? t('clashTemplates.editTemplate') : t('clashTemplates.addTemplate') %></h2>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="<%= formAction %>" class="form" id="clashTemplateForm">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="templateName"><%= t('clashTemplates.name') %></label>
+                    <input id="templateName" name="name" type="text" maxlength="80" required value="<%= editor.name || '' %>" placeholder="<%= t('clashTemplates.namePlaceholder') %>">
+                </div>
+                <div class="form-group">
+                    <label for="templateDescription"><%= t('clashTemplates.description') %></label>
+                    <input id="templateDescription" name="description" type="text" maxlength="500" value="<%= editor.description || '' %>" placeholder="<%= t('clashTemplates.descriptionPlaceholder') %>">
+                </div>
+            </div>
+
+            <div class="template-safety-note">
+                <i class="ti ti-shield-lock"></i>
+                <div>
+                    <strong><%= t('clashTemplates.dynamicNodesTitle') %></strong>
+                    <p><%= t('clashTemplates.dynamicNodesHint') %></p>
+                    <code>__CELERITY_PROXIES__</code>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <div class="yaml-label-row">
+                    <label for="templateYaml"><%= t('clashTemplates.yaml') %></label>
+                    <button type="button" class="btn btn-sm" id="insertStarter"><i class="ti ti-wand"></i> <%= t('clashTemplates.insertStarter') %></button>
+                </div>
+                <textarea id="templateYaml" name="yaml" class="yaml-editor" rows="24" required spellcheck="false" placeholder="<%= starterYaml %>"><%= editor.yaml || '' %></textarea>
+                <small><%= t('clashTemplates.yamlHint') %></small>
+            </div>
+
+            <div class="alert alert-warning lan-exposure-warning" id="lanExposureWarning" hidden>
+                <i class="ti ti-alert-triangle"></i>
+                <span><strong><%= t('clashTemplates.lanWarningTitle') %></strong> <%= t('clashTemplates.lanWarning') %></span>
+            </div>
+
+            <label class="checkbox-label template-active-toggle">
+                <input type="checkbox" name="active" <%= editor.active !== false ? 'checked' : '' %>>
+                <span><%= t('clashTemplates.active') %></span>
+            </label>
+            <small class="hint"><%= t('clashTemplates.activeHint') %></small>
+
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary"><i class="ti ti-device-floppy"></i> <%= isEditing ? t('common.save') : t('common.create') %></button>
+                <% if (isEditing) { %>
+                    <a href="/panel/clash-templates" class="btn"><%= t('common.cancel') %></a>
+                <% } %>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card mt-2">
+    <div class="card-header">
+        <h2><i class="ti ti-files"></i> <%= t('clashTemplates.savedTemplates') %> (<%= templates.length %>)</h2>
+    </div>
+    <div class="card-body">
+        <% if (templates.length === 0) { %>
+            <div class="empty-state">
+                <span class="empty-icon"><i class="ti ti-file-code"></i></span>
+                <p><%= t('clashTemplates.noTemplates') %></p>
+                <p class="hint"><%= t('clashTemplates.noTemplatesHint') %></p>
+            </div>
+        <% } else { %>
+            <div class="template-list">
+                <% templates.forEach(template => { %>
+                    <article class="template-row <%= template.active ? '' : 'is-inactive' %>">
+                        <div class="template-row-title">
+                            <div>
+                                <h3><%= template.name %></h3>
+                                <% if (template.description) { %><p><%= template.description %></p><% } %>
+                            </div>
+                            <span class="badge <%= template.active ? 'badge-success' : '' %>"><%= template.active ? t('common.active') : t('common.inactive') %></span>
+                        </div>
+                        <div class="template-meta">
+                            <span><i class="ti ti-users"></i> <%= template.usersCount || 0 %> <%= t('clashTemplates.assignedUsers') %></span>
+                            <span><i class="ti ti-history"></i> v<%= template.revision || 1 %></span>
+                        </div>
+                        <div class="template-actions">
+                            <a href="/panel/clash-templates?edit=<%= template._id %>" class="btn btn-sm btn-primary"><i class="ti ti-edit"></i> <%= t('common.edit') %></a>
+                            <form method="POST" action="/panel/clash-templates/<%= template._id %>/delete" class="template-delete-form" data-confirm="<%= t('clashTemplates.confirmDelete').replace('{name}', template.name) %>">
+                                <button type="submit" class="btn btn-sm btn-danger"><i class="ti ti-trash"></i> <%= t('common.delete') %></button>
+                            </form>
+                        </div>
+                    </article>
+                <% }); %>
+            </div>
+        <% } %>
+    </div>
+</div>
+
+<style>
+.clash-template-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.yaml-label-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .45rem; }
+.yaml-label-row label { margin-bottom: 0; }
+.yaml-editor { width: 100%; min-height: 28rem; resize: vertical; font-family: "JetBrains Mono", monospace; font-size: .84rem; line-height: 1.55; tab-size: 2; white-space: pre; }
+.template-safety-note { display: flex; gap: .8rem; align-items: flex-start; margin: .25rem 0 1rem; padding: .9rem 1rem; border: 1px solid rgba(99, 102, 241, .28); border-radius: var(--radius-sm); background: rgba(99, 102, 241, .08); }
+.template-safety-note > i { color: var(--accent); font-size: 1.25rem; margin-top: .1rem; }
+.template-safety-note p { color: var(--text-muted); margin: .2rem 0 .5rem; }
+.template-safety-note code { color: var(--text-primary); }
+.lan-exposure-warning { display: flex; align-items: flex-start; gap: .55rem; }
+.lan-exposure-warning[hidden] { display: none; }
+.template-active-toggle { margin-top: .8rem; }
+.template-list { display: flex; flex-direction: column; }
+.template-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 1.25rem; min-width: 0; padding: 1rem 0; border-bottom: 1px solid var(--glass-border); }
+.template-row:first-child { padding-top: 0; }
+.template-row:last-child { padding-bottom: 0; border-bottom: 0; }
+.template-row.is-inactive { opacity: .72; }
+.template-row-title { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; min-width: 0; }
+.template-row-title h3 { margin: 0; overflow-wrap: anywhere; }
+.template-row-title p { margin: .3rem 0 0; color: var(--text-muted); overflow-wrap: anywhere; }
+.template-meta { display: flex; flex-wrap: wrap; gap: .8rem; color: var(--text-muted); font-size: .85rem; }
+.template-actions { display: flex; align-items: center; gap: .5rem; margin-top: auto; }
+.template-delete-form { margin: 0; }
+.empty-state { text-align: center; padding: 2rem; color: var(--text-muted); }
+@media (max-width: 768px) {
+    .clash-template-heading, .yaml-label-row { align-items: stretch; flex-direction: column; }
+    .yaml-label-row .btn, .clash-template-heading .btn { width: 100%; }
+    .yaml-editor { min-height: 23rem; font-size: .78rem; }
+    .template-row { grid-template-columns: 1fr; align-items: stretch; gap: .75rem; }
+    .template-actions, .template-actions .btn, .template-delete-form { width: 100%; }
+}
+</style>
+
+<script>
+(function () {
+    const editor = document.getElementById('templateYaml');
+    const starter = <%- JSON.stringify(starterYaml) %>;
+    const warning = document.getElementById('lanExposureWarning');
+    const insertButton = document.getElementById('insertStarter');
+
+    function updateLanWarning() {
+        const source = editor.value;
+        const allowsLan = /^\s*allow-lan\s*:\s*true\s*(?:#.*)?$/mi.test(source);
+        const bindsAll = /^\s*bind-address\s*:\s*(?:"\*"|'\*'|\*)\s*(?:#.*)?$/mi.test(source);
+        warning.hidden = !(allowsLan && bindsAll);
+    }
+
+    insertButton.addEventListener('click', function () {
+        if (!editor.value.trim() || window.confirm(<%- JSON.stringify(t('clashTemplates.replaceEditorConfirm')) %>)) {
+            editor.value = starter;
+            editor.focus();
+            updateLanWarning();
+        }
+    });
+    editor.addEventListener('input', updateLanWarning);
+    document.querySelectorAll('.template-delete-form').forEach(function (form) {
+        form.addEventListener('submit', function (event) {
+            if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+        });
+    });
+    updateLanWarning();
+})();
+</script>

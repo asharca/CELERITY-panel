@@ -15,6 +15,7 @@ const Settings = require('../../models/settingsModel');
 const cache = require('../../services/cacheService');
 const backupService = require('../../services/backupService');
 const hostMetrics = require('../../services/hostMetricsService');
+const onlinePresenceService = require('../../services/onlinePresenceService');
 const logger = require('../../utils/logger');
 const { backupUpload } = require('./helpers');
 
@@ -66,6 +67,18 @@ async function readLastLogLines(filePath, maxLines) {
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
+
+// GET /panel/presence - In-memory live Hysteria presence snapshot.
+router.get('/presence', async (req, res) => {
+    try {
+        const snapshot = await onlinePresenceService.readySnapshot();
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, snapshot });
+    } catch (error) {
+        logger.error(`[Presence] Snapshot route failed: ${error.message}`);
+        res.status(503).json({ success: false, error: 'Live presence is unavailable' });
+    }
+});
 
 // GET /panel/system-stats
 router.get('/system-stats', async (req, res) => {

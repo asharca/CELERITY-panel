@@ -11,9 +11,13 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
+const YAML = require('yaml');
 const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
+// Register the ref before either the native or Marzban query populates it.
+require('../models/clashTemplateModel');
 const cache = require('../services/cacheService');
+const clashTemplateService = require('../services/clashTemplateService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
@@ -65,7 +69,8 @@ function isBrowser(req) {
 async function getUserByToken(token) {
     const user = await HyUser.findOne({ subscriptionToken: token })
         .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual')
-        .populate('groups', '_id name subscriptionTitle maxDevices');
+        .populate('groups', '_id name subscriptionTitle maxDevices')
+        .populate('clashTemplate');
     
     return user;
 }
@@ -872,60 +877,59 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
     const fingerprint = inbound.fingerprint || 'chrome';
     const name = _xrayInboundName(node, inbound);
 
-    let proxy = `  - name: "${name}"
-    type: vless
-    server: ${host}
-    port: ${inbound.port || node.port || 443}
-    uuid: "${user.xrayUuid}"
-    udp: true`;
+    const proxy = {
+        name,
+        type: 'vless',
+        server: host,
+        port: inbound.port || node.port || 443,
+        uuid: user.xrayUuid,
+        udp: true,
+    };
 
     if (security === 'reality') {
         const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host;
-        proxy += `
-    network: ${transport}
-    tls: true
-    reality-opts:
-      public-key: "${inbound.realityPublicKey || ''}"
-      short-id: "${(inbound.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"
-    servername: ${sni}
-    client-fingerprint: ${fingerprint}`;
-        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
+        proxy.network = transport;
+        proxy.tls = true;
+        proxy['reality-opts'] = {
+            'public-key': inbound.realityPublicKey || '',
+            'short-id': (inbound.realityShortIds || ['']).find(id => id && id.length > 0) || '',
+        };
+        proxy.servername = sni;
+        proxy['client-fingerprint'] = fingerprint;
+        if (transport === 'tcp' && inbound.flow) proxy.flow = inbound.flow;
     } else if (security === 'tls') {
         const tls = _resolveXrayTlsClientHints(node);
-        proxy += `
-    network: ${transport}
-    tls: true
-    servername: ${tls.sni || host}
-    client-fingerprint: ${fingerprint}`;
-        if (tls.allowInsecure) proxy += `\n    skip-cert-verify: true`;
+        proxy.network = transport;
+        proxy.tls = true;
+        proxy.servername = tls.sni || host;
+        proxy['client-fingerprint'] = fingerprint;
+        if (tls.allowInsecure) proxy['skip-cert-verify'] = true;
         if (inbound.alpn && inbound.alpn.length > 0) {
-            proxy += `\n    alpn:\n${inbound.alpn.map(a => `      - ${a}`).join('\n')}`;
+            proxy.alpn = [...inbound.alpn];
         }
-        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
+        if (transport === 'tcp' && inbound.flow) proxy.flow = inbound.flow;
     } else {
-        proxy += `\n    network: ${transport}`;
+        proxy.network = transport;
     }
 
     const tlsHints = security === 'tls' ? _resolveXrayTlsClientHints(node) : null;
 
     if (transport === 'ws') {
-        proxy += `
-    ws-opts:
-      path: "${inbound.wsPath || '/'}"`;
+        proxy['ws-opts'] = { path: inbound.wsPath || '/' };
         const wsHost = inbound.wsHost || (tlsHints ? tlsHints.host : '');
-        if (wsHost) proxy += `\n      headers:\n        Host: "${wsHost}"`;
+        if (wsHost) proxy['ws-opts'].headers = { Host: wsHost };
     } else if (transport === 'grpc') {
-        proxy += `
-    grpc-opts:
-      grpc-service-name: "${inbound.grpcServiceName || 'grpc'}"`;
+        proxy['grpc-opts'] = {
+            'grpc-service-name': inbound.grpcServiceName || 'grpc',
+        };
     } else if (transport === 'xhttp') {
         // Mihomo (Clash Meta) supports XHTTP since 1.18.x via xhttp-opts
-        proxy += `
-    xhttp-opts:
-      path: "${inbound.xhttpPath || '/'}"
-      mode: "${inbound.xhttpMode || 'auto'}"`;
+        proxy['xhttp-opts'] = {
+            path: inbound.xhttpPath || '/',
+            mode: inbound.xhttpMode || 'auto',
+        };
         const xhttpHost = inbound.xhttpHost || (tlsHints ? tlsHints.host : '');
-        if (xhttpHost) proxy += `\n      host: "${xhttpHost}"`;
+        if (xhttpHost) proxy['xhttp-opts'].host = xhttpHost;
     }
 
     return { name, proxy };
@@ -940,7 +944,12 @@ function _buildClashVlessProxies(user, node) {
         .map(inbound => _buildClashVlessProxyForInbound(user, node, inbound));
 }
 
-function generateClashYAML(user, nodes, routing) {
+/**
+ * Build every server-owned Clash value as structured data. Keeping credentials
+ * out of template text prevents a template author from selecting or replacing
+ * authentication material; templates only receive these already-built values.
+ */
+function buildClashServerData(user, nodes) {
     const auth = `${user.userId}:${user.password}`;
     const proxies = [];
     const proxyNames = [];
@@ -967,23 +976,25 @@ function generateClashYAML(user, nodes, routing) {
                 const name = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
                 proxyNames.push(name);
 
-                let proxy = `  - name: "${name}"
-    type: hysteria2
-    server: ${cfg.host}
-    port: ${cfg.port}
-    password: "${auth}"
-    sni: ${cfg.sni || cfg.host}
-    skip-cert-verify: ${!cfg.hasCert}
-    alpn:
-      - h3`;
+                const proxy = {
+                    name,
+                    type: 'hysteria2',
+                    server: cfg.host,
+                    port: cfg.port,
+                    password: auth,
+                    sni: cfg.sni || cfg.host,
+                    'skip-cert-verify': !cfg.hasCert,
+                    alpn: ['h3'],
+                };
 
                 if (cfg.portRange) {
-                    proxy += `\n    ports: ${cfg.portRange}`;
+                    proxy.ports = cfg.portRange;
                     const hopIntervalSec = parseDurationSeconds(normalizeHopInterval(cfg.hopInterval));
-                    if (hopIntervalSec > 0) proxy += `\n    hop-interval: ${hopIntervalSec}`;
+                    if (hopIntervalSec > 0) proxy['hop-interval'] = hopIntervalSec;
                 }
                 if (cfg.obfs && cfg.obfsPassword) {
-                    proxy += `\n    obfs: ${cfg.obfs}\n    obfs-password: "${cfg.obfsPassword}"`;
+                    proxy.obfs = cfg.obfs;
+                    proxy['obfs-password'] = cfg.obfsPassword;
                 }
                 proxies.push(proxy);
             });
@@ -1007,41 +1018,124 @@ function generateClashYAML(user, nodes, routing) {
         const url = obs.destination || 'http://www.gstatic.com/generate_204';
         const intervalSec = parseDurationSeconds(obs.interval || '1m') || 60;
         const groupType = vnode.virtual?.strategy === 'random' ? 'load-balance' : 'url-test';
-        virtualGroups.push(
-            `  - name: "${groupName}"\n    type: ${groupType}\n    url: ${url}\n    interval: ${intervalSec}\n    proxies:\n${sourceNames.map(n => `      - "${n}"`).join('\n')}`
-        );
+        virtualGroups.push({
+            name: groupName,
+            type: groupType,
+            url,
+            interval: intervalSec,
+            proxies: sourceNames,
+        });
         // Surface the balancer at the top of the user-facing select group too.
         proxyNames.unshift(groupName);
     });
 
-    let yaml = `proxies:\n${proxies.join('\n')}\n\nproxy-groups:\n  - name: "Proxy"\n    type: select\n    proxies:\n${proxyNames.map(n => `      - "${n}"`).join('\n')}\n`;
-    if (virtualGroups.length > 0) {
-        yaml += virtualGroups.join('\n') + '\n';
-    }
+    const proxyGroups = [
+        { name: 'Proxy', type: 'select', proxies: [...proxyNames] },
+        ...virtualGroups,
+    ];
+
+    return { proxies, proxyNames, proxyGroups, virtualGroups };
+}
+
+/** Build the exact legacy Clash configuration, now as an object. */
+function buildLegacyClashConfig(user, nodes, routing) {
+    const serverData = buildClashServerData(user, nodes);
+    const config = {
+        proxies: serverData.proxies,
+        'proxy-groups': serverData.proxyGroups,
+    };
 
     if (routing && routing.enabled && routing.rules && routing.rules.length > 0) {
-        const clashDns = buildClashDns(routing.rules, routing.dns);
-        const dnsLines = ['dns:', '  enable: true', '  ipv6: false'];
-        dnsLines.push(`  default-nameserver:\n    - ${clashDns['default-nameserver'][0]}`);
-        dnsLines.push(`  nameserver:\n    - ${clashDns.nameserver[0]}`);
-        const policy = clashDns['nameserver-policy'];
-        if (policy && Object.keys(policy).length > 0) {
-            dnsLines.push('  nameserver-policy:');
-            for (const [k, v] of Object.entries(policy)) {
-                dnsLines.push(`    "${k}": "${v}"`);
-            }
-        }
-        yaml += '\n' + dnsLines.join('\n') + '\n';
+        config.dns = buildClashDns(routing.rules, routing.dns);
 
         const clashRules = buildClashRules(routing.rules);
         if (clashRules.length > 0) {
-            yaml += '\nrules:\n';
-            yaml += clashRules.map(r => `  - ${r}`).join('\n') + '\n';
-            yaml += '  - MATCH,Proxy\n';
+            config.rules = [...clashRules, 'MATCH,Proxy'];
         }
     }
 
-    return yaml;
+    return { config, serverData };
+}
+
+function isActiveClashTemplate(template) {
+    return !!(template && typeof template === 'object' && template.active === true && template.yaml);
+}
+
+/**
+ * Populate the optional assignment for every entry path (including Marzban's
+ * compatibility route, which loads a user independently). Missing, deleted or
+ * inactive refs intentionally behave exactly like an unassigned user.
+ */
+async function resolveAssignedClashTemplate(user) {
+    if (!user || !user.clashTemplate) return null;
+
+    try {
+        let template = user.clashTemplate;
+        // An ObjectId has no template fields. HyUser.populate works for both a
+        // Mongoose document and the lean/plain objects used by tests.
+        if (!template || template.active === undefined || template.yaml === undefined) {
+            const populatedUser = await HyUser.populate(user, { path: 'clashTemplate' });
+            template = populatedUser?.clashTemplate || null;
+        }
+        return isActiveClashTemplate(template) ? template : null;
+    } catch (_) {
+        // Population errors must not make an otherwise valid subscription fail.
+        logger.warn('[Sub] Clash template could not be resolved; using legacy configuration');
+        return null;
+    }
+}
+
+/**
+ * Version the Clash cache namespace by both assignment and revision. Template
+ * edits therefore become visible immediately without flushing other formats.
+ */
+function buildClashCacheFormat(format, template) {
+    if (!isActiveClashTemplate(template)) return format;
+    const safe = value => String(value ?? '').replace(/[^a-zA-Z0-9_.-]/g, '_');
+    const identity = safe(template._id || template.id || 'assigned');
+    const revision = safe(template.revision ?? 0);
+    return `${format}+template:${identity}:${revision}`;
+}
+
+function mergeServerVirtualGroups(config, virtualGroups) {
+    if (!config || typeof config !== 'object' || !Array.isArray(virtualGroups) || virtualGroups.length === 0) {
+        return config;
+    }
+    if (!Array.isArray(config['proxy-groups'])) config['proxy-groups'] = [];
+    // Server-owned virtual groups win a deterministic name collision. This
+    // prevents a template group from hijacking a virtual node name already
+    // expanded through __CELERITY_PROXIES__.
+    const virtualNames = new Set(virtualGroups.map(group => group.name));
+    config['proxy-groups'] = config['proxy-groups']
+        .filter(group => !virtualNames.has(group && group.name));
+    config['proxy-groups'].push(...virtualGroups);
+    return config;
+}
+
+/**
+ * Render a Clash subscription. A bad/deleted template must never take the
+ * user's subscription down, so compilation falls back to the legacy object.
+ * Parser errors are deliberately not logged because they may include excerpts
+ * from administrator-authored YAML.
+ */
+function generateClashYAML(user, nodes, routing, clashTemplate = null) {
+    const { config: legacyConfig, serverData } = buildLegacyClashConfig(user, nodes, routing);
+    let config = legacyConfig;
+
+    if (clashTemplate && isActiveClashTemplate(clashTemplate)) {
+        try {
+            config = clashTemplateService.compileTemplate(clashTemplate, {
+                proxies: serverData.proxies,
+                proxyNames: serverData.proxyNames,
+            });
+            mergeServerVirtualGroups(config, serverData.virtualGroups);
+        } catch (_) {
+            logger.warn(`[Sub] Clash template compilation failed; using legacy configuration`);
+            config = legacyConfig;
+        }
+    }
+
+    return YAML.stringify(config, { lineWidth: 0 });
 }
 
 function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
@@ -2753,9 +2847,16 @@ async function serveSubscription(req, res, ctx) {
     // HAPP/Incy may upgrade a "uri" response to xray-json, so split the cache
     // keyspace from plain URI consumers on the same token. HAPP and Incy share
     // one namespace (identical body; routing scheme differs post-cache).
-    const cacheFormat = (isXrayProfileClient(userAgent) && (format === 'uri' || format === 'raw'))
+    let cacheFormat = (isXrayProfileClient(userAgent) && (format === 'uri' || format === 'raw'))
         ? `${format}+xprofile`
         : format;
+
+    // Resolve before the cache lookup. This is required for the Marzban
+    // compatibility path too, whose user query does not populate the ref.
+    const clashTemplate = (format === 'clash' || format === 'yaml')
+        ? await resolveAssignedClashTemplate(user)
+        : null;
+    cacheFormat = buildClashCacheFormat(cacheFormat, clashTemplate);
 
     const cached = await cache.getSubscription(cacheToken, cacheFormat);
     if (cached) {
@@ -2773,7 +2874,15 @@ async function serveSubscription(req, res, ctx) {
 
     logger.debug(`[Sub] Serving ${nodes.length} nodes to user ${user.userId}`);
 
-    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', settings?.routing);
+    const subscriptionData = generateSubscriptionData(
+        user,
+        nodes,
+        format,
+        userAgent,
+        settings?.subscription?.happProviderId || '',
+        settings?.routing,
+        clashTemplate
+    );
     await cache.setSubscription(cacheToken, cacheFormat, subscriptionData);
     return sendCachedSubscription(res, subscriptionData, format, userAgent, settings, hwidHeaders);
 }
@@ -2827,7 +2936,7 @@ router.get('/files/:token', async (req, res) => {
 /**
  * Generate subscription data for caching
  */
-function generateSubscriptionData(user, nodes, format, userAgent, happProviderId = '', routing = null) {
+function generateSubscriptionData(user, nodes, format, userAgent, happProviderId = '', routing = null, clashTemplate = null) {
     let content;
     let needsBase64 = false;
     // Effective format may differ from requested when we transparently upgrade
@@ -2843,7 +2952,7 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
             break;
         case 'clash':
         case 'yaml':
-            content = generateClashYAML(user, nodes, routing);
+            content = generateClashYAML(user, nodes, routing, clashTemplate);
             break;
         case 'singbox':
         case 'json':
@@ -3019,3 +3128,12 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+// Narrow test surface for the Clash template integration. Keeping these under
+// one property avoids turning every internal subscription helper into API.
+module.exports._clashTemplateHelpers = {
+    buildClashServerData,
+    buildLegacyClashConfig,
+    generateClashYAML,
+    resolveAssignedClashTemplate,
+    buildClashCacheFormat,
+};

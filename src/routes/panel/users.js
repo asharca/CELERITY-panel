@@ -4,6 +4,7 @@ const router = express.Router();
 const HyUser = require('../../models/hyUserModel');
 const HyNode = require('../../models/hyNodeModel');
 const ServerGroup = require('../../models/serverGroupModel');
+const ClashTemplate = require('../../models/clashTemplateModel');
 const cryptoService = require('../../services/cryptoService');
 const syncService = require('../../services/syncService');
 const expireScheduler = require('../../services/expireScheduler');
@@ -20,6 +21,32 @@ async function isHwidFeatureEnabled() {
     const s = await getSettings();
     const m = s?.subscription?.happ?.hwid?.mode || 'off';
     return m === 'permissive' || m === 'strict';
+}
+
+async function getActiveClashTemplates() {
+    return ClashTemplate.find({ active: true })
+        .select('name description revision')
+        .sort({ name: 1 })
+        .lean();
+}
+
+async function resolveClashTemplate(rawValue) {
+    const value = String(rawValue || '').trim();
+    if (!value) return null;
+    if (!mongoose.isValidObjectId(value)) {
+        const error = new Error('Invalid Clash template');
+        error.statusCode = 400;
+        throw error;
+    }
+    const template = await ClashTemplate.findOne({ _id: value, active: true })
+        .select('_id')
+        .lean();
+    if (!template) {
+        const error = new Error('Clash template is unavailable');
+        error.statusCode = 400;
+        throw error;
+    }
+    return template._id;
 }
 
 // ==================== USERS ====================
@@ -115,9 +142,10 @@ router.get('/users', async (req, res) => {
 // GET /users/add - Create user form
 router.get('/users/add', async (req, res) => {
     try {
-        const [groups, hwidEnabled] = await Promise.all([
+        const [groups, hwidEnabled, clashTemplates] = await Promise.all([
             getActiveGroups(),
             isHwidFeatureEnabled(),
+            getActiveClashTemplates(),
         ]);
         render(res, 'user-form', {
             title: res.locals.locales.users.newUser,
@@ -127,6 +155,7 @@ router.get('/users/add', async (req, res) => {
             user: null,
             error: null,
             hwidEnabled,
+            clashTemplates,
         });
     } catch (error) {
         logger.error('[Panel] GET /users/add error:', error.message);
@@ -137,10 +166,11 @@ router.get('/users/add', async (req, res) => {
 // GET /users/:userId/edit - Edit user form
 router.get('/users/:userId/edit', async (req, res) => {
     try {
-        const [user, groups, hwidEnabled] = await Promise.all([
+        const [user, groups, hwidEnabled, clashTemplates] = await Promise.all([
             HyUser.findOne({ userId: req.params.userId }).populate('groups', 'name color'),
             getActiveGroups(),
             isHwidFeatureEnabled(),
+            getActiveClashTemplates(),
         ]);
 
         if (!user) {
@@ -155,9 +185,10 @@ router.get('/users/:userId/edit', async (req, res) => {
             isEdit: true,
             error: null,
             hwidEnabled,
+            clashTemplates,
         });
     } catch (error) {
-        res.status(500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
+        res.status(error.statusCode || 500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
     }
 });
 
@@ -214,6 +245,8 @@ router.post('/users', async (req, res) => {
             if (!Number.isNaN(d.getTime())) hwidEnforceFrom = d;
         }
         
+        const clashTemplate = await resolveClashTemplate(req.body.clashTemplate);
+
         const newUser = await HyUser.create({
             userId,
             username: username || '',
@@ -226,6 +259,7 @@ router.post('/users', async (req, res) => {
             hwidEnforceFrom,
             expireAt,
             nodes: [],
+            clashTemplate,
         });
 
         await invalidateUserCache(userId, newUser.subscriptionToken);
@@ -247,7 +281,7 @@ router.post('/users', async (req, res) => {
 
         res.redirect(`/panel/users/${userId}`);
     } catch (error) {
-        res.status(500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
+        res.status(error.statusCode || 500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
     }
 });
 
@@ -255,9 +289,10 @@ router.post('/users', async (req, res) => {
 router.post('/users/:userId', async (req, res) => {
     try {
         const { username, trafficLimitGB, expireDays, expireAt: expireAtRaw, enabled, maxDevices } = req.body;
-        const [user, availableGroups] = await Promise.all([
+        const [user, availableGroups, clashTemplates] = await Promise.all([
             HyUser.findOne({ userId: req.params.userId }),
             getActiveGroups(),
+            getActiveClashTemplates(),
         ]);
 
         if (!user) {
@@ -281,6 +316,7 @@ router.post('/users/:userId', async (req, res) => {
             hwidMode: ['inherit', 'off', 'strict'].includes(String(req.body.hwidMode)) ? req.body.hwidMode : (user.hwidMode || 'inherit'),
             hwidEnforceFrom: req.body.hwidEnforceFrom || user.hwidEnforceFrom,
             expireAt: expireAtRaw,
+            clashTemplate: req.body.clashTemplate || null,
         };
 
         let expireAt = null;
@@ -299,6 +335,7 @@ router.post('/users/:userId', async (req, res) => {
                     isEdit: true,
                     error: res.locals.t('users.expireAtInvalidError'),
                     hwidEnabled: await isHwidFeatureEnabled(),
+                    clashTemplates,
                 });
             }
 
@@ -312,12 +349,15 @@ router.post('/users/:userId', async (req, res) => {
             draftUser.expireAt = null;
         }
 
+        const clashTemplate = await resolveClashTemplate(req.body.clashTemplate);
+
         const updates = {
             username: username || '',
             groups,
             trafficLimit,
             expireAt,
             maxDevices: userMaxDevices,
+            clashTemplate,
         };
 
         // Only forward `enabled` when the checkbox state actually differs from
@@ -380,7 +420,7 @@ router.post('/users/:userId', async (req, res) => {
 
         res.redirect(`/panel/users/${req.params.userId}`);
     } catch (error) {
-        res.status(500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
+        res.status(error.statusCode || 500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
     }
 });
 

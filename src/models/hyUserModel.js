@@ -50,6 +50,14 @@ const hyUserSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'HyNode',
     }],
+
+    /** Optional per-user Clash/Mihomo subscription template. */
+    clashTemplate: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'ClashTemplate',
+        default: null,
+        index: true,
+    },
     
     traffic: {
         tx: { type: Number, default: 0 },
@@ -124,4 +132,3 @@ hyUserSchema.statics.findByToken = function(token) {
 };
 
 module.exports = mongoose.model('HyUser', hyUserSchema);
-

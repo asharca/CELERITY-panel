@@ -66,7 +66,7 @@ assert.deepStrictEqual(
     try {
         axios.get = async url => {
             getUrls.push(url);
-            return { data: url.includes('/online') ? { alice: {} } : {} };
+            return { data: url.includes('/online') ? { alice: 1 } : {} };
         };
         axios.post = async url => {
             postUrls.push(url);

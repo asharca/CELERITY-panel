@@ -25,6 +25,7 @@ const syncService = require('./src/services/syncService');
 const expireScheduler = require('./src/services/expireScheduler');
 const cacheService = require('./src/services/cacheService');
 const statsService = require('./src/services/statsService');
+const onlinePresenceService = require('./src/services/onlinePresenceService');
 const HyUser = require('./src/models/hyUserModel');
 const HyNode = require('./src/models/hyNodeModel');
 const backupService = require('./src/services/backupService');
@@ -634,6 +635,7 @@ async function startServer() {
         // Boot catchup + arm next-fire-time timer for subscription expiry.
         // Also sweeps over-traffic users one time (migration of dirty state).
         await expireScheduler.init();
+        onlinePresenceService.start();
         
         const PORT = process.env.PORT || 3000;
         const useCaddy = process.env.USE_CADDY === 'true';
@@ -765,6 +767,7 @@ function setupWebSocketServer(server) {
     const wssTerminal = new WebSocketServer({ noServer: true });
     const wssLogs = new WebSocketServer({ noServer: true });
     const wssBroadcast = new WebSocketServer({ noServer: true });
+    const wssPresence = new WebSocketServer({ noServer: true });
     const sshTerminal = require('./src/services/sshTerminal');
     const BroadcastSession = require('./src/services/broadcastTerminal');
     const crypto = require('crypto');
@@ -799,6 +802,10 @@ function setupWebSocketServer(server) {
             } else if (pathname === '/ws/broadcast') {
                 wssBroadcast.handleUpgrade(request, socket, head, (ws) => {
                     wssBroadcast.emit('connection', ws, request);
+                });
+            } else if (pathname === '/ws/presence') {
+                wssPresence.handleUpgrade(request, socket, head, (ws) => {
+                    wssPresence.emit('connection', ws, request);
                 });
             } else {
                 socket.destroy();
@@ -954,8 +961,30 @@ function setupWebSocketServer(server) {
             logger.logEmitter.off('log', onLog);
         });
     });
+
+    // Live Hysteria user presence. One server-side poller feeds every panel.
+    wssPresence.on('connection', (ws) => {
+        logger.info('[WS] Presence stream connected');
+
+        const sendSnapshot = (snapshot) => {
+            if (ws.readyState !== 1 || ws.bufferedAmount > 1024 * 1024) return;
+            ws.send(JSON.stringify({ type: 'presence', snapshot }));
+        };
+        const cleanup = () => {
+            onlinePresenceService.off('snapshot', sendSnapshot);
+        };
+
+        sendSnapshot(onlinePresenceService.getSnapshot());
+        onlinePresenceService.on('snapshot', sendSnapshot);
+
+        ws.on('close', () => {
+            cleanup();
+            logger.info('[WS] Presence stream disconnected');
+        });
+        ws.on('error', cleanup);
+    });
     
-    logger.info('[WS] WebSocket server initialized (terminal + logs)');
+    logger.info('[WS] WebSocket server initialized (terminal + logs + presence)');
 }
 
 function setupCronJobs() {
@@ -1161,6 +1190,7 @@ async function shutdown(signal) {
     if (isShuttingDown) return;
     isShuttingDown = true;
     logger.info(`[Server] ${signal} received, shutting down...`);
+    onlinePresenceService.stop();
     await Promise.all(
         activeServers.map(s => new Promise(resolve => s.close(resolve)))
     );
