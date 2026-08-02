@@ -17,6 +17,7 @@ const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
+const { getSubscriptionTitle, getSubscriptionContentDisposition } = require('../utils/subscriptionTitle');
 const { formatTraffic } = require('../utils/formatTraffic');
 const { getDateLocale, normalizeLanguage } = require('../middleware/i18n');
 const uaStats = require('../services/uaStatsService');
@@ -67,20 +68,6 @@ async function getUserByToken(token) {
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
     return user;
-}
-
-/**
- * Get subscription title for a user.
- * Takes subscriptionTitle from the first group, or the group name.
- */
-function getSubscriptionTitle(user) {
-    if (!user.groups || user.groups.length === 0) {
-        return 'Hysteria';
-    }
-    
-    // Take the first group
-    const group = user.groups[0];
-    return group.subscriptionTitle || group.name || 'Hysteria';
 }
 
 /**
@@ -2935,7 +2922,7 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
     
     const headers = {
         'Content-Type': `${contentType}; charset=utf-8`,
-        'Content-Disposition': `attachment; filename="${data.username}"`,
+        'Content-Disposition': getSubscriptionContentDisposition(data.profileTitle),
         'Profile-Title': encodeTitle(data.profileTitle),
         'Profile-Update-Interval': String(settings?.subscription?.updateInterval || 12),
         'Subscription-Userinfo': [

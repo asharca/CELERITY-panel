@@ -78,7 +78,7 @@ async function ensureStarterAccessBundle(nodeIds) {
                 name: 'Celerity Primary Access',
                 description: 'Created automatically during onboarding.',
                 color: '#6366f1',
-                subscriptionTitle: 'C³ CELERITY',
+                subscriptionTitle: 'renhedata-vpn',
             },
             $set: { active: true },
         },
