@@ -247,7 +247,21 @@
     "pauseLogs": "Pause logs",
     "resumeLogs": "Resume logs",
     "logsConnected": "Live",
-    "logsDisconnected": "Disconnected"
+    "logsDisconnected": "Disconnected",
+    "liveOnlineUsers": "Live Online Users",
+    "liveConnected": "Live",
+    "liveConnecting": "Connecting",
+    "liveReconnecting": "Reconnecting",
+    "livePartial": "Some node data is unavailable",
+    "liveUser": "User",
+    "liveNode": "Active Node",
+    "liveClients": "Clients",
+    "liveEmpty": "No users are online",
+    "liveUnknownUser": "Unknown user",
+    "liveDisabled": "Disabled",
+    "liveStale": "Stale data",
+    "liveUpdatedNow": "Updated now",
+    "liveUpdatedSeconds": "Updated {seconds}s ago"
   },
   "nodes": {
     "title": "Nodes",

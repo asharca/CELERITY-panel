@@ -247,7 +247,21 @@
     "pauseLogs": "Пауза",
     "resumeLogs": "Продолжить",
     "logsConnected": "Live",
-    "logsDisconnected": "Отключено"
+    "logsDisconnected": "Отключено",
+    "liveOnlineUsers": "Пользователи онлайн",
+    "liveConnected": "В реальном времени",
+    "liveConnecting": "Подключение",
+    "liveReconnecting": "Переподключение",
+    "livePartial": "Данные части нод недоступны",
+    "liveUser": "Пользователь",
+    "liveNode": "Активная нода",
+    "liveClients": "Клиенты",
+    "liveEmpty": "Нет пользователей онлайн",
+    "liveUnknownUser": "Неизвестный пользователь",
+    "liveDisabled": "Отключён",
+    "liveStale": "Устаревшие данные",
+    "liveUpdatedNow": "Обновлено сейчас",
+    "liveUpdatedSeconds": "Обновлено {seconds} сек. назад"
   },
   "nodes": {
     "title": "Ноды",

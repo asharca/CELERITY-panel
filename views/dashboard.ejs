@@ -23,7 +23,7 @@
             <span class="stat-trend"><%= t('common.now') %></span>
         </div>
         <div class="stat-value" id="onlineCount"><%= stats.onlineUsers %></div>
-        <div class="stat-label"><%= t('common.connections') %></div>
+        <div class="stat-label"><span id="onlineConnections"><%= stats.onlineUsers %></span> <%= t('dashboard.liveClients') %></div>
     </div>
     
     <div class="stat-card stat-traffic">
@@ -187,6 +187,38 @@
                 </div>
     </div>
 </div>
+
+        <!-- Live Online Users -->
+        <div class="card mt-2" id="liveOnlinePanel">
+            <div class="card-header live-online-header">
+                <h2>
+                    <span class="live-online-dot connecting" id="liveOnlineDot"></span>
+                    <i class="ti ti-users-group"></i> <%= t('dashboard.liveOnlineUsers') %>
+                </h2>
+                <div class="live-online-meta" aria-live="polite">
+                    <span id="liveOnlineStatus"><%= t('dashboard.liveConnecting') %></span>
+                    <span id="liveOnlineAge"></span>
+                </div>
+            </div>
+            <div class="card-body no-padding">
+                <div class="table-wrapper live-online-table-wrap">
+                    <table class="table live-online-table">
+                        <thead>
+                            <tr>
+                                <th><%= t('dashboard.liveUser') %></th>
+                                <th><%= t('dashboard.liveNode') %></th>
+                                <th><%= t('dashboard.liveClients') %></th>
+                            </tr>
+                        </thead>
+                        <tbody id="liveOnlineRows">
+                            <tr class="live-online-empty">
+                                <td colspan="3"><%= t('common.loading') %></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
 
         <!-- Logs -->
         <div class="card mt-2">
@@ -391,6 +423,118 @@
 .online-limit {
     color: var(--text-muted);
     font-size: 0.85em;
+}
+.live-online-header {
+    gap: 12px;
+}
+.live-online-header h2,
+.live-online-meta,
+.live-presence-user,
+.live-presence-node {
+    display: flex;
+    align-items: center;
+}
+.live-online-meta {
+    gap: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+.live-online-dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+.live-online-dot.connected {
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.14);
+}
+.live-online-dot.connecting {
+    background: var(--warning);
+    animation: pulse 1s infinite;
+}
+.live-online-dot.partial,
+.live-online-dot.disconnected {
+    background: var(--danger);
+}
+.live-online-table th:last-child,
+.live-online-table td:last-child {
+    width: 110px;
+    text-align: right;
+}
+.live-online-table td {
+    vertical-align: middle;
+}
+.live-presence-user,
+.live-presence-node {
+    min-width: 0;
+    gap: 8px;
+}
+.live-presence-name {
+    min-width: 0;
+    color: var(--text-primary);
+    font-weight: 600;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+}
+.live-presence-id {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+.live-presence-flag {
+    flex: 0 0 auto;
+}
+.live-presence-clients {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+}
+.live-presence-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 18px;
+    margin-left: 6px;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+.live-presence-badge.disabled {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+.live-presence-badge.stale {
+    border-color: var(--warning);
+    color: var(--warning);
+}
+.live-online-empty td {
+    height: 72px;
+    color: var(--text-muted);
+    text-align: center !important;
+}
+@media (max-width: 640px) {
+    .live-online-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    .live-online-meta {
+        padding-left: 16px;
+        white-space: normal;
+    }
+    .live-online-table th,
+    .live-online-table td {
+        padding-left: 10px;
+        padding-right: 10px;
+    }
+    .live-online-table th:last-child,
+    .live-online-table td:last-child {
+        width: 72px;
+    }
 }
 .node-comment {
     display: inline-block;
@@ -896,3 +1040,19 @@ async function restoreBackup(input) {
 }
 
 </script>
+<script>
+window.CelerityLiveOnlineI18n = <%- JSON.stringify({
+    connected: t('dashboard.liveConnected'),
+    connecting: t('dashboard.liveConnecting'),
+    reconnecting: t('dashboard.liveReconnecting'),
+    partial: t('dashboard.livePartial'),
+    empty: t('dashboard.liveEmpty'),
+    unknownUser: t('dashboard.liveUnknownUser'),
+    disabled: t('dashboard.liveDisabled'),
+    stale: t('dashboard.liveStale'),
+    updatedNow: t('dashboard.liveUpdatedNow'),
+    updatedSeconds: t('dashboard.liveUpdatedSeconds'),
+    clients: t('dashboard.liveClients')
+}) %>;
+</script>
+<script src="/js/live-online.js"></script>
