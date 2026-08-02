@@ -7,6 +7,9 @@ const selectedGroupIds = new Set(
 const trafficLimitGB = isEditMode ? Math.round((user.trafficLimit || 0) / (1024 * 1024 * 1024)) : 0;
 const maxDevicesValue = isEditMode ? (parseInt(user.maxDevices, 10) || 0) : 0;
 const hwidModeVal = isEditMode ? (user.hwidMode || 'inherit') : 'inherit';
+const selectedClashTemplateId = isEditMode && user.clashTemplate
+    ? String(user.clashTemplate._id || user.clashTemplate)
+    : '';
 let hwidEnforceStr = '';
 if (isEditMode && user.hwidEnforceFrom) {
     const _d = new Date(user.hwidEnforceFrom);
@@ -60,6 +63,19 @@ const expireAtIso = hasExpireAt ? new Date(user.expireAt).toISOString() : '';
                 </div>
                 <small><%= t('users.groupsHint') %></small>
                 </div>
+
+            <div class="form-group">
+                <label for="clashTemplate"><%= t('users.clashTemplate') %></label>
+                <select name="clashTemplate" id="clashTemplate">
+                    <option value=""><%= t('users.clashTemplateDefault') %></option>
+                    <% (typeof clashTemplates !== 'undefined' ? clashTemplates : []).forEach(template => { %>
+                        <option value="<%= template._id %>" <%= selectedClashTemplateId === String(template._id) ? 'selected' : '' %>>
+                            <%= template.name %><%= template.description ? ` — ${template.description}` : '' %>
+                        </option>
+                    <% }); %>
+                </select>
+                <small><%= t('users.clashTemplateHint') %> <a href="/panel/clash-templates"><%= t('users.manageClashTemplates') %></a></small>
+            </div>
                 
             <div class="form-row">
                 <div class="form-group">

@@ -63,6 +63,10 @@
                     <span class="nav-icon"><i class="ti ti-users"></i></span>
                     <span><%= t('nav.users') %></span>
                 </a></li>
+                <li><a href="/panel/clash-templates" class="<%= page === 'clashTemplates' ? 'active' : '' %>">
+                    <span class="nav-icon"><i class="ti ti-file-code"></i></span>
+                    <span><%= t('nav.clashTemplates') %></span>
+                </a></li>
                 <% if (typeof accessLogsEnabled !== 'undefined' && accessLogsEnabled) { %>
                 <li><a href="/panel/access-logs" class="<%= page === 'accessLogs' ? 'active' : '' %>">
                     <span class="nav-icon"><i class="ti ti-list-search"></i></span>
