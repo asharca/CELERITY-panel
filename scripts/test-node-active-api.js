@@ -10,9 +10,11 @@ let invalidateCount = 0;
 let runtimeStopCalls = [];
 let runtimeStartCalls = [];
 let xraySyncCalls = [];
+let firewallCalls = [];
 let runtimeStopResult = { success: true, attempted: true, service: 'xray', active: false };
 let runtimeStartResult = { success: true, attempted: true, service: 'hysteria-server', active: true };
 let xraySyncResult = true;
+let firewallResult = true;
 
 function clone(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -67,11 +69,16 @@ const stubs = {
             runtimeStartCalls.push(clone(node));
             return clone(runtimeStartResult);
         },
+        isSameVpsAsPanel: () => false,
     },
     '../services/syncService': {
         updateNodeConfig: async (node) => {
             xraySyncCalls.push(clone(node));
             return xraySyncResult;
+        },
+        reconcilePortHopping: async (...args) => {
+            firewallCalls.push(clone(args));
+            return firewallResult;
         },
         schedulePush: () => {
             throw new Error('schedulePush must not be called by active toggles');
@@ -145,9 +152,11 @@ function reset() {
     runtimeStopCalls = [];
     runtimeStartCalls = [];
     xraySyncCalls = [];
+    firewallCalls = [];
     runtimeStopResult = { success: true, attempted: true, service: 'xray', active: false };
     runtimeStartResult = { success: true, attempted: true, service: 'hysteria-server', active: true };
     xraySyncResult = true;
+    firewallResult = true;
 }
 
 (async () => {
@@ -185,6 +194,8 @@ function reset() {
         active: false,
         status: 'offline',
         onlineUsers: 0,
+        port: 11443,
+        portRange: '20000-50000',
         ssh: { privateKey: 'encrypted' },
     });
     runtimeStartResult = { success: true, attempted: true, service: 'hysteria-server', active: true };
@@ -192,10 +203,38 @@ function reset() {
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(res.body.node.active, true);
     assert.strictEqual(res.body.node.status, 'online');
-    assert.strictEqual(runtimeStartCalls.length, 1);
+    assert.strictEqual(runtimeStartCalls.length, 0);
+    assert.strictEqual(xraySyncCalls.length, 1);
+    assert.strictEqual(firewallCalls.length, 1);
+    assert.strictEqual(firewallCalls[0][1], '');
+    assert.strictEqual(firewallCalls[0][2], 11443);
+    assert.strictEqual(firewallCalls[0][3], '20000-50000');
+    assert.deepStrictEqual(firewallCalls[0][4], {
+        previousMainPortEnabled: false,
+        desiredMainPortEnabled: true,
+    });
     assert.strictEqual(db.get('hysteria-1').active, true);
     assert.strictEqual(db.get('hysteria-1').lastError, '');
     assert.strictEqual(invalidateCount, 1);
+
+    reset();
+    db.set('hysteria-firewall-failed', {
+        _id: 'hysteria-firewall-failed',
+        name: 'Hysteria Firewall Failed',
+        type: 'hysteria',
+        active: false,
+        status: 'offline',
+        onlineUsers: 0,
+        port: 11443,
+        portRange: '',
+        ssh: { privateKey: 'encrypted' },
+    });
+    firewallResult = false;
+    res = await runRoute('/:id/enable', 'hysteria-firewall-failed');
+    assert.strictEqual(res.statusCode, 500);
+    assert.match(res.body.error, /firewall/i);
+    assert.strictEqual(db.get('hysteria-firewall-failed').active, false);
+    assert.strictEqual(db.get('hysteria-firewall-failed').status, 'offline');
 
     reset();
     db.set('xray-agent-1', {

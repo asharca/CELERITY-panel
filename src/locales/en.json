@@ -270,7 +270,7 @@
     "commentHint": "Free-form note shown in the node list and dashboard (up to 500 characters)",
     "port": "Main Port",
     "portRange": "Port Hopping Range",
-    "portRangeHint": "Clients will connect to these ports",
+    "portRangeHint": "Leave empty to disable port hopping; otherwise clients will connect to these ports",
     "statsPort": "Stats API Port",
     "statsSecret": "API Secret",
     "sectionStatsApi": "Stats API",

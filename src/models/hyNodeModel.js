@@ -3,11 +3,31 @@
  */
 
 const mongoose = require('mongoose');
+const { normalizePortRange, parsePortRange } = require('../utils/portRange');
+
+function optionalPortRangeField() {
+    return {
+        type: String,
+        default: '',
+        trim: true,
+        set: value => {
+            const normalized = value === undefined || value === null
+                ? ''
+                : normalizePortRange(typeof value === 'string' ? value : String(value));
+            const parsed = normalized ? parsePortRange(normalized) : null;
+            return parsed ? parsed.normalized : normalized;
+        },
+        validate: {
+            validator: value => !value || !!parsePortRange(value),
+            message: 'portRange must use start-end with ports between 1 and 65535',
+        },
+    };
+}
 
 const portConfigSchema = new mongoose.Schema({
     name: { type: String, default: '' },
     port: { type: Number, required: true },
-    portRange: { type: String, default: '' },
+    portRange: optionalPortRangeField(),
     enabled: { type: Boolean, default: true },
 }, { _id: false });
 
@@ -288,7 +308,9 @@ const hyNodeSchema = new mongoose.Schema({
     domain: { type: String, default: '' },
     sni: { type: String, default: '' },
     port: { type: Number, default: 443 },
-    portRange: { type: String, default: '20000-50000' },
+    // Port hopping is opt-in. A non-empty range publishes the hopping entry
+    // and configures the corresponding server-side forwarding rules.
+    portRange: optionalPortRangeField(),
     hopInterval: { type: String, default: '' },
     portConfigs: { type: [portConfigSchema], default: [] },
     obfs: {
@@ -416,14 +438,16 @@ hyNodeSchema.pre('validate', function(next) {
 hyNodeSchema.virtual('serverAddress').get(function() {
     if (this.type === 'virtual') return '';
     const host = this.domain || this.ip;
-    return `${host}:${this.portRange}`;
+    const range = parsePortRange(this.portRange)?.normalized;
+    return `${host}:${range || this.port || 443}`;
 });
 
 hyNodeSchema.methods.getSubscriptionAddress = function() {
     if (this.type === 'virtual') return '';
     const host = this.domain || this.ip;
-    if (this.portRange && this.portRange.includes('-')) {
-        return `${host}:${this.portRange}`;
+    const range = parsePortRange(this.portRange)?.normalized;
+    if (range) {
+        return `${host}:${range}`;
     }
     return `${host}:${this.port}`;
 };

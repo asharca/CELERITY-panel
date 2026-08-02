@@ -16,6 +16,7 @@ const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
 const NodeSSH = require('./nodeSSH');
+const sshPool = require('./sshPoolService');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
 const { invalidateNodesCache, invalidateUserCache } = require('../utils/helpers');
@@ -26,6 +27,7 @@ const config = require('../../config');
 const webhook = require('./webhookService');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
+const { normalizePortRange, parsePortRange } = require('../utils/portRange');
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -39,7 +41,7 @@ const HEALTH_FAILURE_THRESHOLD = 3;
 // Dotted keys (e.g. "xray.realityPrivateKey") are matched via their root.
 const CONFIG_AFFECTING_FIELDS = new Set([
     // Shared
-    'domain', 'sni', 'port', 'portRange', 'statsPort', 'statsSecret',
+    'type', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'statsSecret', 'active',
     'useCustomConfig', 'customConfig',
     // Hysteria
     'obfs', 'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -249,6 +251,7 @@ class SyncService {
     constructor() {
         this.isSyncing = false;
         this.lastSyncTime = null;
+        this.nodePushQueues = new Map();
     }
 
     /**
@@ -256,6 +259,20 @@ class SyncService {
      */
     getAuthUrl() {
         return `${config.BASE_URL}/api/auth`;
+    }
+
+    enqueueNodeTask(nodeId, task) {
+        const queueKey = String(nodeId);
+        const previousTask = this.nodePushQueues.get(queueKey) || Promise.resolve();
+        const currentTask = previousTask.catch(() => {}).then(task);
+
+        this.nodePushQueues.set(queueKey, currentTask);
+        currentTask.finally(() => {
+            if (this.nodePushQueues.get(queueKey) === currentTask) {
+                this.nodePushQueues.delete(queueKey);
+            }
+        });
+        return currentTask;
     }
 
     // ==================== XRAY AGENT METHODS ====================
@@ -481,6 +498,14 @@ class SyncService {
     async updateXrayNodeConfig(node) {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
+        const failSync = async message => {
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: message },
+            });
+            await invalidateNodesCache();
+            logger.error(`[Xray Sync] Node ${node.name}: ${message}`);
+            return false;
+        };
 
         // Pull the operator-supplied private key if the node uses manual TLS;
         // it is intentionally hidden from default queries (select:false).
@@ -495,22 +520,14 @@ class SyncService {
             configContent = configGenerator.generateXrayConfig(node, users);
         } catch (genErr) {
             if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
-                logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
-                await HyNode.updateOne({ _id: node._id }, {
-                    $set: {
-                        status: 'error',
-                        lastSync: new Date(),
-                        lastError: genErr.message,
-                    },
-                });
-                await invalidateNodesCache();
-                return false;
+                return failSync(genErr.message);
             }
-            throw genErr;
+            return failSync(genErr.message);
         }
 
         // Step 1: Upload config.json via SSH (only if SSH is configured)
-        if (node.ssh?.password || node.ssh?.privateKey) {
+        const hasSsh = !!(node.ssh?.password || node.ssh?.privateKey);
+        if (hasSsh) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
@@ -595,10 +612,12 @@ class SyncService {
                     }
                 }
             } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
+                return failSync(`Config upload failed: ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
+        } else {
+            return failSync('SSH credentials are required to upload Xray config');
         }
 
         // Step 2: Restart Xray via Agent (preferred) or SSH fallback
@@ -609,16 +628,19 @@ class SyncService {
                 await this._agentRequest(node, 'POST', '/restart');
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
             } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
+                return failSync(`Agent restart failed: ${error.message}`);
             }
-        } else if (node.ssh?.password || node.ssh?.privateKey) {
+        } else if (hasSsh) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
-                await ssh.exec('systemctl restart xray');
+                const restart = await ssh.exec('systemctl restart xray');
+                if (!restart || restart.code !== 0) {
+                    throw new Error(restart?.stderr || restart?.stdout || 'systemctl restart xray failed');
+                }
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${error.message}`);
+                return failSync(`SSH restart failed: ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
@@ -637,7 +659,7 @@ class SyncService {
                 await this._agentRequest(node, 'POST', '/sync', { users: userPayload });
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
             } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${error.message}`);
+                return failSync(`Agent user sync failed: ${error.message}`);
             }
         }
 
@@ -819,23 +841,199 @@ class SyncService {
      * @param {string} nodeId  - Node _id
      * @param {Object} [updates] - $set payload applied to the node. When omitted,
      *                             the push is assumed relevant and runs unconditionally.
+     * @param {Object} [options]
+     * @param {string} [options.previousPortRange] - Range before this update;
+     *        when changed, reconcile remote firewall rules after config push.
+     * @param {number} [options.previousPort] - Main port before this update.
+     * @param {string} [options.previousType] - Node type before this update.
+     * @param {string} [options.previousIp] - SSH target before this update.
+     * @param {string} [options.previousDomain] - Domain before this update.
+     * @param {boolean} [options.previousActive] - Active state before this update.
+     * @param {Object} [options.previousSsh] - SSH credentials before this update.
      */
-    schedulePush(nodeId, updates = null) {
+    schedulePush(nodeId, updates = null, options = {}) {
         if (!hasConfigRelevantUpdates(updates)) return;
-        setImmediate(async () => {
-            try {
+        setImmediate(() => {
+            this.enqueueNodeTask(nodeId, async () => {
+                try {
                 const node = await HyNode.findById(nodeId);
-                if (!node || !node.active) return;
-                if (node.cascadeRole === 'bridge') return;
+                if (!node) {
+                    const previousWasHysteria = options.previousType === 'hysteria';
+                    const previousSameVps = previousWasHysteria && isSameVpsAsPanel({
+                        ip: options.previousIp,
+                        domain: options.previousDomain,
+                    });
+                    const previousRange = previousWasHysteria && !previousSameVps
+                        ? parsePortRange(options.previousPortRange)?.normalized || ''
+                        : '';
+                    const previousSsh = options.previousSsh;
+                    if (
+                        previousRange
+                        && options.previousIp
+                        && (previousSsh?.password || previousSsh?.privateKey)
+                    ) {
+                        const deletedSnapshot = {
+                            _id: `${nodeId}:deleted-previous:${options.previousIp}`,
+                            name: `Deleted node ${nodeId} (previous target)`,
+                            type: 'hysteria',
+                            ip: options.previousIp,
+                            port: options.previousPort || 443,
+                            portRange: '',
+                            ssh: previousSsh,
+                        };
+                        await this.reconcilePortHopping(
+                            deletedSnapshot,
+                            previousRange,
+                            deletedSnapshot.port,
+                            '',
+                            { previousMainPortEnabled: true, desiredMainPortEnabled: true }
+                        );
+                    }
+                    return;
+                }
 
                 const hasSsh = !!(node.ssh?.password || node.ssh?.privateKey);
+                const hasPreviousSsh = !!(options.previousSsh?.password || options.previousSsh?.privateKey);
                 const hasAgent = !!(node.xray && node.xray.agentToken);
-                if (!hasSsh && !hasAgent) return;
+                const previousWasHysteria = options.previousType === undefined
+                    ? node.type === 'hysteria'
+                    : options.previousType === 'hysteria';
+                const involvedHysteria = node.type === 'hysteria' || previousWasHysteria;
+                const reactivating = options.previousActive === false && node.active;
+                const previousSameVps = previousWasHysteria && isSameVpsAsPanel({
+                    ip: options.previousIp === undefined ? node.ip : options.previousIp,
+                    domain: options.previousDomain === undefined ? node.domain : options.previousDomain,
+                });
+                const previousRange = options.previousPortRange === undefined
+                    ? null
+                    : previousWasHysteria && !previousSameVps
+                        ? parsePortRange(options.previousPortRange)?.normalized || ''
+                        : '';
+                const sameVps = node.type === 'hysteria' && isSameVpsAsPanel(node);
+                const desiredRange = node.type === 'hysteria' && !sameVps
+                    ? parsePortRange(node.portRange)?.normalized || ''
+                    : '';
+                const previousPort = Number(options.previousPort || node.port || 443);
+                const desiredPort = Number(node.port || 443);
+                const previousIp = options.previousIp === undefined ? node.ip : options.previousIp;
+                const targetChanged = String(previousIp || '') !== String(node.ip || '');
+                const previousMainPortEnabled = previousWasHysteria && !reactivating;
+                const desiredMainPortEnabled = node.type === 'hysteria';
+                const needsPortReconcile = involvedHysteria
+                    && previousRange !== null
+                    && (
+                        previousRange !== desiredRange
+                        || (!!(previousRange || desiredRange) && targetChanged)
+                        || (
+                            desiredMainPortEnabled
+                            && (!previousMainPortEnabled || previousPort !== desiredPort || targetChanged)
+                        )
+                    );
+                const cleanupPreviousRange = async () => {
+                    if (!previousRange) return true;
+                    if (!previousIp) return false;
+                    const previousSsh = hasPreviousSsh
+                        ? options.previousSsh
+                        : !targetChanged && hasSsh ? node.ssh : null;
+                    if (!previousSsh) return false;
 
-                await this.updateNodeConfig(node);
-            } catch (error) {
-                logger.warn(`[AutoPush] node ${nodeId}: ${error.message}`);
-            }
+                    // Use a separate pool identity so an updated node record
+                    // cannot redirect cleanup to a newly configured target.
+                    const previousNode = {
+                        _id: `${node._id}:previous:${previousIp}`,
+                        name: `${node.name} (previous target)`,
+                        type: 'hysteria',
+                        ip: previousIp,
+                        port: previousPort,
+                        portRange: '',
+                        ssh: previousSsh,
+                    };
+                    return this.reconcilePortHopping(previousNode, previousRange, previousPort, '', {
+                        previousMainPortEnabled: true,
+                        desiredMainPortEnabled: true,
+                    });
+                };
+                const reconcileActivePortRules = async () => {
+                    if (!needsPortReconcile) return true;
+
+                    if (!targetChanged && hasSsh) {
+                        return this.reconcilePortHopping(
+                            node,
+                            previousRange,
+                            previousPort,
+                            desiredRange,
+                            { previousMainPortEnabled, desiredMainPortEnabled }
+                        );
+                        return;
+                    }
+
+                    const cleaned = await cleanupPreviousRange();
+                    if (!cleaned) return false;
+                    if (node.ip && hasSsh && (desiredRange || desiredMainPortEnabled)) {
+                        return this.reconcilePortHopping(node, '', desiredPort, desiredRange, {
+                            previousMainPortEnabled: false,
+                            desiredMainPortEnabled,
+                        });
+                    }
+                    return !desiredRange && !desiredMainPortEnabled;
+                };
+
+                if (targetChanged) await sshPool.close(node._id);
+
+                // Config is not pushed for inactive/bridge nodes. Cleanup the
+                // old range only; do not install rules for an undeployed state.
+                if (!node.active || node.cascadeRole === 'bridge') {
+                    if (needsPortReconcile && !(await cleanupPreviousRange())) {
+                        logger.warn(`[AutoPush] node ${nodeId}: failed to clean the previous hopping range`);
+                    }
+                    return;
+                }
+                if (!hasSsh && !hasAgent) {
+                    const cleaned = !needsPortReconcile || await cleanupPreviousRange();
+                    if (!cleaned || (needsPortReconcile && desiredMainPortEnabled)) {
+                        const message = 'SSH credentials unavailable for firewall reconciliation';
+                        await HyNode.updateOne(
+                            { _id: node._id },
+                            { $set: {
+                                status: 'error',
+                                lastError: message,
+                                ...(reactivating ? { active: false } : {}),
+                            } }
+                        );
+                        await invalidateNodesCache();
+                        logger.warn(`[AutoPush] node ${nodeId}: ${message}`);
+                    }
+                    return;
+                }
+
+                const configUpdated = await this.updateNodeConfig(node);
+                if (configUpdated === false) {
+                    if (reactivating) {
+                        await HyNode.updateOne({ _id: node._id }, { $set: { active: false } });
+                        await invalidateNodesCache();
+                    }
+                    logger.warn(`[AutoPush] node ${nodeId}: config push failed; firewall state left unchanged`);
+                    return;
+                }
+
+                const firewallUpdated = await reconcileActivePortRules();
+                if (!firewallUpdated) {
+                    const message = 'Firewall reconciliation failed after config update';
+                    await HyNode.updateOne(
+                        { _id: node._id },
+                        { $set: {
+                            status: 'error',
+                            lastError: message,
+                            ...(reactivating ? { active: false } : {}),
+                        } }
+                    );
+                    await invalidateNodesCache();
+                    logger.warn(`[AutoPush] node ${nodeId}: ${message}`);
+                }
+                } catch (error) {
+                    logger.warn(`[AutoPush] node ${nodeId}: ${error.message}`);
+                }
+            });
         });
     }
 
@@ -1276,14 +1474,102 @@ class SyncService {
      * Setup port hopping on node
      */
     async setupPortHopping(node) {
+        if (
+            node.type !== 'hysteria'
+            || isSameVpsAsPanel(node)
+            || !parsePortRange(node.portRange)
+        ) {
+            logger.warn(`[PortHop] Refusing non-Hysteria node or invalid range on ${node.name}`);
+            return false;
+        }
+
         const ssh = new NodeSSH(node);
         
         try {
             await ssh.connect();
-            await ssh.setupPortHopping(node.portRange);
-            return true;
+            return await ssh.setupPortHopping(node.portRange);
         } catch (error) {
             logger.error(`[PortHop] Error on ${node.name}: ${error.message}`);
+            return false;
+        } finally {
+            ssh.disconnect();
+        }
+    }
+
+    /**
+     * Remove owned hopping-range rules after a Hysteria node is deleted.
+     * Main-port firewall rules are deliberately preserved because they may be
+     * shared by another service and have no ownership marker in legacy setups.
+     */
+    schedulePortHoppingCleanup(node) {
+        const previousRange = parsePortRange(node?.portRange)?.normalized || '';
+        const ssh = node?.ssh?.toObject ? node.ssh.toObject() : node?.ssh;
+        if (
+            node?.type !== 'hysteria'
+            || isSameVpsAsPanel(node)
+            || !previousRange
+            || !node.ip
+            || !(ssh?.password || ssh?.privateKey)
+        ) {
+            return;
+        }
+
+        const snapshot = {
+            _id: `${node._id}:deleted:${node.ip}`,
+            name: `${node.name} (deleted)`,
+            type: 'hysteria',
+            ip: node.ip,
+            port: node.port || 443,
+            portRange: '',
+            ssh,
+        };
+        setImmediate(() => {
+            this.enqueueNodeTask(node._id, async () => {
+                const success = await this.reconcilePortHopping(snapshot, previousRange, snapshot.port, '', {
+                    previousMainPortEnabled: true,
+                    desiredMainPortEnabled: true,
+                });
+                if (!success) {
+                    logger.warn(`[PortHop] Delete cleanup failed for ${node.name}`);
+                }
+            });
+        });
+    }
+
+    /**
+     * Apply a port-range transition after a node update. An empty desired
+     * range removes the previous firewall rules without adding replacements.
+     */
+    async reconcilePortHopping(
+        node,
+        previousPortRange,
+        previousPort = null,
+        desiredPortRange = null,
+        portState = {}
+    ) {
+        const previous = normalizePortRange(previousPortRange);
+        const desired = desiredPortRange === null
+            ? node.type === 'hysteria' ? normalizePortRange(node.portRange) : ''
+            : normalizePortRange(desiredPortRange);
+        const oldPort = Number(previousPort || node.port || 443);
+        const mainPort = Number(node.port || 443);
+        const previousMainPortEnabled = portState.previousMainPortEnabled !== false;
+        const desiredMainPortEnabled = portState.desiredMainPortEnabled === undefined
+            ? node.type === 'hysteria'
+            : portState.desiredMainPortEnabled;
+        const needsMainPortOpen = desiredMainPortEnabled
+            && (!previousMainPortEnabled || oldPort !== mainPort);
+        if (previous === desired && !needsMainPortOpen) return true;
+
+        const ssh = new NodeSSH(node);
+        try {
+            await ssh.connect();
+            return await ssh.reconcilePortHopping(desired, previous, oldPort, {
+                previousMainPortEnabled,
+                desiredMainPortEnabled,
+            });
+        } catch (error) {
+            logger.error(`[PortHop] Reconcile error on ${node.name}: ${error.message}`);
             return false;
         } finally {
             ssh.disconnect();

@@ -28,6 +28,10 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
+const {
+    parsePortRange,
+    buildPortHoppingReconcileScript,
+} = require('../utils/portRange');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -438,60 +442,46 @@ class NodeSSH {
         }
     }
 
-    /**
-     * Setup port hopping via iptables
-     */
-    async setupPortHopping(portRange) {
+    async reconcilePortHopping(portRange, previousPortRange = '', previousMainPort = null, portState = {}) {
         try {
             const mainPort = this.node.port || 443;
-            const [startPort, endPort] = portRange.split('-').map(Number);
-            
-            const script = `
-# Clear old rules
-iptables -D INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT 2>/dev/null || true
-ip6tables -D INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT 2>/dev/null || true
-iptables -t nat -D PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-ip6tables -t nat -D PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
+            const script = buildPortHoppingReconcileScript({
+                desiredRange: portRange,
+                previousRange: previousPortRange,
+                mainPort,
+                previousMainPort: previousMainPort || mainPort,
+                previousMainPortEnabled: portState.previousMainPortEnabled !== false,
+                desiredMainPortEnabled: portState.desiredMainPortEnabled !== false,
+            });
+            if (!script) return true;
 
-# Clear legacy interface-specific rules
-for iface in eth0 eth1 ens3 ens5 enp0s3 eno1; do
-    iptables -t nat -D PREROUTING -i $iface -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -i $iface -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-done
+            const result = await this.exec(script);
+            if (!result || result.code !== 0) {
+                const code = result?.code === undefined ? 'unknown' : result.code;
+                throw new Error(result?.stderr || result?.stdout || `firewall command exited with ${code}`);
+            }
 
-# Open hop range in firewall before redirecting it
-iptables -C INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT
-ip6tables -C INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${startPort}:${endPort} -j ACCEPT 2>/dev/null || true
-
-# Add new rules (no interface binding)
-iptables -t nat -C PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort}
-ip6tables -t nat -C PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${startPort}:${endPort} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-
-# Open ports in UFW
-if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow ${startPort}:${endPort}/udp 2>/dev/null || true
-fi
-
-# Save rules
-if command -v netfilter-persistent &> /dev/null; then
-    netfilter-persistent save 2>/dev/null
-elif command -v iptables-save &> /dev/null; then
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-fi
-
-echo "Port hopping: ${startPort}-${endPort} -> ${mainPort}"
-`;
-            
-            await this.exec(script);
-            
-            logger.info(`[SSH] Port hopping configured on ${this.node.name}: ${portRange} -> ${mainPort}`);
+            const action = parsePortRange(portRange)
+                ? `configured (${portRange} -> ${mainPort})`
+                : `disabled (removed ${previousPortRange})`;
+            logger.info(`[SSH] Port hopping ${action} on ${this.node.name}`);
             return true;
         } catch (error) {
-            logger.error(`[SSH] Port hopping setup error: ${error.message}`);
+            logger.error(`[SSH] Port hopping reconcile error: ${error.message}`);
             return false;
         }
+    }
+
+    /**
+     * Setup port hopping via iptables. Empty/invalid ranges are rejected; use
+     * reconcilePortHopping('', previousRange) for cleanup-only transitions.
+     */
+    async setupPortHopping(portRange) {
+        if (!parsePortRange(portRange)) {
+            logger.warn(`[SSH] Refusing invalid port hopping range on ${this.node.name}`);
+            return false;
+        }
+        return this.reconcilePortHopping(portRange, portRange);
     }
     
     /**

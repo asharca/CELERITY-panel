@@ -10,7 +10,7 @@
                     </div>
                     <div class="form-group hysteria-only" id="portRangeGroup" style="<%= node?.type === 'xray' ? 'display:none' : '' %>">
                         <label for="portRange"><%= t('nodes.portRange') %></label>
-                        <input type="text" id="portRange" name="portRange" value="<%= node?.portRange || '20000-50000' %>"
+                        <input type="text" id="portRange" name="portRange" value="<%= node?.portRange ?? '' %>"
                                placeholder="20000-50000">
                         <small><%= t('nodes.portRangeHint') %></small>
                     </div>

@@ -10,24 +10,27 @@ const config = require('../../config');
 const cryptoService = require('./cryptoService');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const { parsePortRange, buildPortHoppingReconcileScript } = require('../utils/portRange');
 
 /**
  * Check if a node is on the same VPS as the panel
- * Uses multiple heuristics: domain match, IP match via DNS, localhost detection
+ * Uses domain, localhost, and configured panel-IP matching heuristics.
  * @param {Object} node - Node object with ip and domain fields
  * @returns {boolean} true if node appears to be on the same server as the panel
  */
 function isSameVpsAsPanel(node) {
-    const panelDomain = (config.PANEL_DOMAIN || '').toLowerCase().trim();
+    const normalizeHost = value => String(value || '').trim().toLowerCase().replace(/\.$/, '');
+    const panelDomain = normalizeHost(config.PANEL_DOMAIN);
     
     // 1. Domain match - most reliable indicator
-    if (node.domain && node.domain === panelDomain) {
+    const nodeDomain = normalizeHost(node.domain);
+    if (nodeDomain && nodeDomain === panelDomain) {
         logger.debug(`[NodeSetup] Same VPS detected: domain match (${node.domain})`);
         return true;
     }
     
     // 2. Localhost / loopback detection
-    const nodeIp = (node.ip || '').toLowerCase().trim();
+    const nodeIp = normalizeHost(node.ip);
     if (panelDomain && nodeIp === panelDomain) {
         logger.debug(`[NodeSetup] Same VPS detected: node IP/host matches panel domain (${nodeIp})`);
         return true;
@@ -37,10 +40,13 @@ function isSameVpsAsPanel(node) {
         return true;
     }
     
-    // 3. Try to resolve panel domain and compare with node IP
-    // This is a sync check using cached DNS or env variable
-    const panelIpFromEnv = process.env.PANEL_IP || '';
-    if (panelIpFromEnv && panelIpFromEnv === nodeIp) {
+    // 3. Compare against explicitly configured host addresses. Multiple
+    // IPv4/IPv6 values can be comma-separated for multi-homed deployments.
+    const panelIps = String(process.env.PANEL_IP || '')
+        .split(',')
+        .map(normalizeHost)
+        .filter(Boolean);
+    if (nodeIp && panelIps.includes(nodeIp)) {
         logger.debug(`[NodeSetup] Same VPS detected: IP match via PANEL_IP env (${nodeIp})`);
         return true;
     }
@@ -242,57 +248,16 @@ hysteria version
 `;
 
 function getPortHoppingScript(portRange, mainPort) {
-    if (!portRange || !portRange.includes('-')) return '';
-    
-    const [start, end] = portRange.split('-').map(p => parseInt(p.trim()));
-    
-    return `
-echo "=== [4/5] Setting up port hopping ${start}-${end} -> ${mainPort} ==="
+    const parsedRange = parsePortRange(portRange);
+    if (!parsedRange) return '';
 
-# Clear old rules
-iptables -D INPUT -p udp --dport ${start}:${end} -j ACCEPT 2>/dev/null || true
-ip6tables -D INPUT -p udp --dport ${start}:${end} -j ACCEPT 2>/dev/null || true
-iptables -t nat -D PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-ip6tables -t nat -D PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-
-# Clear legacy interface-specific rules
-for iface in eth0 eth1 ens3 ens5 enp0s3 eno1; do
-    iptables -t nat -D PREROUTING -i $iface -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -i $iface -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-done
-
-# Open hop range in firewall before redirecting it
-iptables -C INPUT -p udp --dport ${start}:${end} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${start}:${end} -j ACCEPT
-ip6tables -C INPUT -p udp --dport ${start}:${end} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${start}:${end} -j ACCEPT 2>/dev/null || true
-echo "Done: INPUT rules added"
-
-# Add new rules (no interface binding)
-iptables -t nat -C PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort}
-ip6tables -t nat -C PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${start}:${end} -j REDIRECT --to-port ${mainPort} 2>/dev/null || true
-echo "Done: iptables NAT rules added"
-
-# Open ports in firewall (ufw)
-if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow ${start}:${end}/udp 2>/dev/null || true
-    echo "Done: UFW rules added"
-fi
-
-# Save rules
-if command -v netfilter-persistent &> /dev/null; then
-    netfilter-persistent save 2>/dev/null
-    echo "Done: Rules saved with netfilter-persistent"
-elif [ -f /etc/debian_version ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent 2>/dev/null || true
-    netfilter-persistent save 2>/dev/null || true
-elif command -v iptables-save &> /dev/null; then
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    echo "Done: Rules saved with iptables-save"
-fi
-
-echo "Done: Port hopping configured: ${start}-${end} -> ${mainPort}"
-`;
+    return buildPortHoppingReconcileScript({
+        desiredRange: parsedRange.normalized,
+        previousRange: parsedRange.normalized,
+        mainPort,
+        previousMainPortEnabled: false,
+        desiredMainPortEnabled: true,
+    });
 }
 
 const SELF_SIGNED_CERT_SCRIPT = `
@@ -727,36 +692,38 @@ echo "Note: Make sure DNS for ${node.domain} points to this server's IP!"
             } else {
                 log(`Setting up port hopping (${node.portRange})...`);
                 const portHoppingScript = getPortHoppingScript(node.portRange, node.port || 443);
-                if (portHoppingScript) {
-                    const hopResult = await execSSH(conn, portHoppingScript);
-                    logs.push(hopResult.output);
-
-                    if (!hopResult.success) {
-                        log(`Port hopping setup warning: ${hopResult.error}`);
-                    } else {
-                        log('Port hopping configured');
-                    }
+                if (!portHoppingScript) {
+                    throw new Error('Invalid port hopping range');
                 }
+
+                const hopResult = await execSSH(conn, portHoppingScript);
+                logs.push(hopResult.output);
+                if (!hopResult.success) {
+                    throw new Error(`Port hopping setup failed: ${hopResult.error}`);
+                }
+                log('Port hopping configured');
             }
         }
         
         const statsPort = node.statsPort || 9999;
         const mainPort = node.port || 443;
         log(`Opening firewall ports (${mainPort}, ${statsPort})...`);
-        const firewallResult = await execSSH(conn, `
+        const mainPortScript = buildPortHoppingReconcileScript({
+            desiredRange: '',
+            previousRange: '',
+            mainPort,
+            previousMainPortEnabled: false,
+            desiredMainPortEnabled: true,
+        });
+        const firewallResult = await execSSH(conn, `${mainPortScript}
+
 echo "=== [5/6] Opening firewall ports ==="
 
-if command -v iptables &> /dev/null; then
-    iptables -I INPUT -p tcp --dport ${mainPort} -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport ${mainPort} -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport ${statsPort} -j ACCEPT 2>/dev/null || true
-    echo "Done: Ports ${mainPort}, ${statsPort} opened in iptables"
-fi
+iptables -C INPUT -p tcp --dport ${statsPort} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${statsPort} -j ACCEPT || exit 1
+echo "Done: Ports ${mainPort}, ${statsPort} opened in iptables"
 
 if command -v ufw &> /dev/null && ufw status | grep -q "active"; then
-    ufw allow ${mainPort}/tcp 2>/dev/null || true
-    ufw allow ${mainPort}/udp 2>/dev/null || true
-    ufw allow ${statsPort}/tcp 2>/dev/null || true
+    ufw allow ${statsPort}/tcp >/dev/null 2>&1 || exit 1
     echo "Done: Ports ${mainPort}, ${statsPort} opened in ufw"
 fi
 
@@ -765,6 +732,9 @@ ${IPTABLES_SAVE_SNIPPET}
 echo "Done: Firewall configured"
         `);
         logs.push(firewallResult.output);
+        if (!firewallResult.success) {
+            throw new Error(`Firewall setup failed: ${firewallResult.error}`);
+        }
         log('Firewall ports opened');
         
         if (restartService) {

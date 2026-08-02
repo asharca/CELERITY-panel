@@ -17,6 +17,7 @@ const cascadeService = require('../../services/cascadeService');
 const statsService = require('../../services/statsService');
 const uaStatsService = require('../../services/uaStatsService');
 const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers');
+const { normalizePortRange, canonicalizePortRange } = require('../../utils/portRange');
 const { buildNodeUiMeta } = require('../../utils/nodeUi');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
@@ -358,7 +359,7 @@ router.post('/nodes', async (req, res) => {
             sni: req.body.sni || '',
             flag: req.body.flag || '',
             port: parseInt(req.body.port) || 443,
-            portRange: req.body.portRange || '20000-50000',
+            portRange: canonicalizePortRange(req.body.portRange),
             statsPort: parseInt(req.body.statsPort) || 9999,
             statsSecret,
             groups,
@@ -599,6 +600,15 @@ router.post('/nodes/:id', async (req, res) => {
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }
+        const previousPortRange = normalizePortRange(existingNode.portRange);
+        const previousPort = existingNode.port;
+        const previousType = existingNode.type;
+        const previousIp = existingNode.ip;
+        const previousDomain = existingNode.domain;
+        const previousActive = existingNode.active;
+        const previousSsh = existingNode.ssh?.toObject
+            ? existingNode.ssh.toObject()
+            : existingNode.ssh;
 
         const { name } = req.body;
         const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
@@ -623,7 +633,7 @@ router.post('/nodes/:id', async (req, res) => {
             domain: req.body.domain || '',
             sni: req.body.sni || '',
             port: parseInt(req.body.port) || 443,
-            portRange: req.body.portRange || '20000-50000',
+            portRange: canonicalizePortRange(req.body.portRange),
             statsPort: parseInt(req.body.statsPort) || 9999,
             groups,
             maxOnlineUsers: parseInt(req.body.maxOnlineUsers) || 0,
@@ -704,7 +714,15 @@ router.post('/nodes/:id', async (req, res) => {
         existingNode.set(updates);
         await existingNode.save();
 
-        syncService.schedulePush(nodeId, updates);
+        syncService.schedulePush(nodeId, updates, {
+            previousPortRange,
+            previousPort,
+            previousType,
+            previousIp,
+            previousDomain,
+            previousActive,
+            previousSsh,
+        });
 
         // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
         const sshChanged = updates['ssh.password'] !== undefined

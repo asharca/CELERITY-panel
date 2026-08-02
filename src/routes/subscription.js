@@ -23,6 +23,8 @@ const uaStats = require('../services/uaStatsService');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
 const hwidDeviceService = require('../services/hwidDeviceService');
 const webhookService = require('../services/webhookService');
+const { getNodeConfigs } = require('../utils/hysteriaNodeConfigs');
+const { isSameVpsAsPanel } = require('../services/nodeSetup');
 
 // ==================== HELPERS ====================
 
@@ -265,47 +267,6 @@ function validateUser(user) {
     }
     return { valid: true };
 }
-
-function getNodeConfigs(node) {
-    if (node.type !== 'hysteria') return [];
-    const configs = [];
-    const host = node.domain || node.ip;
-    // SNI logic:
-    // - If domain is set (ACME): SNI MUST be domain (server's sniGuard will reject other values)
-    // - If no domain (self-signed): can use custom SNI for domain fronting
-    const sni = node.domain ? node.domain : (node.sni || '');
-    // hasCert: true if domain is set (ACME = valid cert)
-    const hasCert = !!node.domain;
-    const hopInterval = node.hopInterval || '';
-    
-    const obfs = node.obfs?.type || '';
-    const obfsPassword = node.obfs?.password || '';
-
-    if (node.portConfigs && node.portConfigs.length > 0) {
-        node.portConfigs.filter(c => c.enabled).forEach(cfg => {
-            configs.push({
-                name: cfg.name || `Port ${cfg.port}`,
-                host,
-                port: cfg.port,
-                portRange: cfg.portRange || '',
-                hopInterval,
-                sni,
-                hasCert,
-                obfs,
-                obfsPassword,
-            });
-        });
-    } else {
-        configs.push({ name: 'TLS', host, port: node.port || 443, portRange: '', hopInterval, sni, hasCert, obfs, obfsPassword });
-        // Port 80 removed (used for ACME)
-        if (node.portRange) {
-            configs.push({ name: 'Hopping', host, port: node.port || 443, portRange: node.portRange, hopInterval, sni, hasCert, obfs, obfsPassword });
-        }
-    }
-    
-    return configs;
-}
-
 
 // ==================== URI GENERATION ====================
 
@@ -909,7 +870,7 @@ function generateURIList(user, nodes) {
         if (node.type === 'xray') {
             generateVlessURIs(user, node).forEach(uri => uris.push(uri));
         } else {
-            getNodeConfigs(node).forEach(cfg => {
+            getNodeConfigs(node, { allowPortHopping: !isSameVpsAsPanel(node) }).forEach(cfg => {
                 uris.push(generateURI(user, node, cfg));
             });
         }
@@ -1015,7 +976,7 @@ function generateClashYAML(user, nodes, routing) {
                 proxies.push(proxy);
             });
         } else {
-            getNodeConfigs(node).forEach(cfg => {
+            getNodeConfigs(node, { allowPortHopping: !isSameVpsAsPanel(node) }).forEach(cfg => {
                 const name = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
                 proxyNames.push(name);
 
@@ -1029,9 +990,11 @@ function generateClashYAML(user, nodes, routing) {
     alpn:
       - h3`;
 
-                if (cfg.portRange) proxy += `\n    ports: ${cfg.portRange}`;
-                const hopIntervalSec = parseDurationSeconds(normalizeHopInterval(cfg.hopInterval));
-                if (hopIntervalSec > 0) proxy += `\n    hop-interval: ${hopIntervalSec}`;
+                if (cfg.portRange) {
+                    proxy += `\n    ports: ${cfg.portRange}`;
+                    const hopIntervalSec = parseDurationSeconds(normalizeHopInterval(cfg.hopInterval));
+                    if (hopIntervalSec > 0) proxy += `\n    hop-interval: ${hopIntervalSec}`;
+                }
                 if (cfg.obfs && cfg.obfsPassword) {
                     proxy += `\n    obfs: ${cfg.obfs}\n    obfs-password: "${cfg.obfsPassword}"`;
                 }
@@ -1264,7 +1227,7 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride) {
         return built;
     }
 
-    getNodeConfigs(node).forEach(cfg => {
+    getNodeConfigs(node, { allowPortHopping: !isSameVpsAsPanel(node) }).forEach(cfg => {
         const displayName = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
         const tag = tagOverride ? tagOverride(built.length, displayName) : displayName;
         const hysteriaSettings = { version: 2, auth };
@@ -1543,7 +1506,7 @@ function generateSingboxJSON(user, nodes, routing) {
                 proxyOutbounds.push(outbound);
             });
         } else {
-            getNodeConfigs(node).forEach(cfg => {
+            getNodeConfigs(node, { allowPortHopping: !isSameVpsAsPanel(node) }).forEach(cfg => {
                 const tag = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
                 tags.push(tag);
 
@@ -1566,9 +1529,11 @@ function generateSingboxJSON(user, nodes, routing) {
                     outbound.server_port = cfg.port;
                 }
 
-                const hopInterval = normalizeHopInterval(cfg.hopInterval);
-                if (hopInterval) {
-                    outbound.hop_interval = hopInterval;
+                if (cfg.portRange) {
+                    const hopInterval = normalizeHopInterval(cfg.hopInterval);
+                    if (hopInterval) {
+                        outbound.hop_interval = hopInterval;
+                    }
                 }
 
                 if (cfg.obfs && cfg.obfsPassword) {
@@ -1795,7 +1760,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', 
                 }
             });
         } else {
-            getNodeConfigs(node).forEach(cfg => {
+            getNodeConfigs(node, { allowPortHopping: !isSameVpsAsPanel(node) }).forEach(cfg => {
                 allConfigs.push({
                     location: node.name,
                     flag: node.flag || '🌐',

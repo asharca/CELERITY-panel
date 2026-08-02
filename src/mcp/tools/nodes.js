@@ -10,6 +10,7 @@ const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
+const { normalizePortRange, parsePortRange, canonicalizePortRange } = require('../../utils/portRange');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -96,7 +97,7 @@ const manageNodeSchema = z.object({
         domain: z.string().optional(),
         sni: z.string().optional(),
         port: z.number().optional(),
-        portRange: z.string().optional(),
+        portRange: z.string().optional().describe('UDP port-hopping range; omit or pass an empty string to disable'),
         type: z.enum(['hysteria', 'xray', 'virtual']).optional().describe('Node type. "virtual" is a load-balancer entry (HAPP/Xray-core balancer + Singbox/Clash url-test/load-balance group) without its own remote server'),
         groups: z.array(z.string()).optional(),
         active: z.boolean().optional(),
@@ -345,6 +346,13 @@ async function manageNode(args, emit) {
                 resolvedSsh = sibling?.ssh || cryptoService.encryptSshCredentials({});
             }
 
+            let normalizedPortRange;
+            try {
+                normalizedPortRange = canonicalizePortRange(data.portRange);
+            } catch (error) {
+                return { error: error.message, code: 400 };
+            }
+
             const nodeData = {
                 name: data.name,
                 ip: nodeType === 'virtual' ? null : data.ip,
@@ -352,7 +360,7 @@ async function manageNode(args, emit) {
                 domain: data.domain || '',
                 sni: data.sni || '',
                 port: data.port || 443,
-                portRange: data.portRange || '20000-50000',
+                portRange: normalizedPortRange,
                 statsPort: 9999,
                 statsSecret,
                 groups: data.groups || [],
@@ -409,7 +417,7 @@ async function manageNode(args, emit) {
         case 'update': {
             if (!id) throw new Error('id is required for update');
             const allowed = [
-                'name', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
+                'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort', 'groups', 'ssh', 'paths',
                 'settings', 'active', 'rankingCoefficient', 'country', 'comment', 'cascadeRole', 'type',
                 'virtual',
                 'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -424,6 +432,12 @@ async function manageNode(args, emit) {
                     updates[k] = cryptoService.encryptSshCredentials(data[k]);
                 } else if (k === 'comment') {
                     updates[k] = typeof data[k] === 'string' ? data[k].trim().slice(0, 500) : '';
+                } else if (k === 'portRange') {
+                    try {
+                        updates[k] = canonicalizePortRange(data[k]);
+                    } catch (error) {
+                        return { error: error.message, code: 400 };
+                    }
                 } else {
                     updates[k] = data[k];
                 }
@@ -439,12 +453,12 @@ async function manageNode(args, emit) {
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            const existing = await HyNode.findById(id).select('type ip virtual').lean();
+            const existing = await HyNode.findById(id).select('type ip domain virtual port portRange active ssh').lean();
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
             const nextType = updates.type || existing.type;
             const nextVirtual = updates.virtual !== undefined ? updates.virtual : existing.virtual;
-            const nextIp = existing.ip;
+            const nextIp = updates.ip !== undefined ? updates.ip : existing.ip;
 
             if (nextType === 'virtual') {
                 const v = nextVirtual || {};
@@ -467,7 +481,15 @@ async function manageNode(args, emit) {
             // Auto-push config to the node if any config-affecting field changed.
             // Virtual nodes have no remote service to push to — schedulePush will
             // simply emit a no-op via the existing type guards in syncService.
-            getSyncService().schedulePush(node._id, updates);
+            getSyncService().schedulePush(node._id, updates, {
+                previousPortRange: normalizePortRange(existing.portRange),
+                previousPort: existing.port,
+                previousType: existing.type,
+                previousIp: existing.ip,
+                previousDomain: existing.domain,
+                previousActive: existing.active,
+                previousSsh: existing.ssh,
+            });
 
             logger.info(`[MCP] Updated node ${node.name}`);
             return { success: true, node };
@@ -477,6 +499,7 @@ async function manageNode(args, emit) {
             if (!id) throw new Error('id is required for delete');
             const node = await HyNode.findByIdAndDelete(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
+            getSyncService().schedulePortHoppingCleanup(node);
             await HyUser.updateMany({ nodes: node._id }, { $pull: { nodes: node._id } });
             await invalidateNodesCache();
             logger.info(`[MCP] Deleted node ${node.name}`);
@@ -567,8 +590,14 @@ async function manageNode(args, emit) {
             if (!id) throw new Error('id is required for setup_port_hopping');
             const node = await HyNode.findById(id);
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
-            if (node.type === 'virtual') {
-                return { error: 'Virtual nodes have no remote server', code: 400 };
+            if (node.type !== 'hysteria') {
+                return { error: 'Port hopping is only supported for Hysteria nodes', code: 400 };
+            }
+            if (require('../../services/nodeSetup').isSameVpsAsPanel(node)) {
+                return { error: 'Port hopping is not supported for same-VPS nodes', code: 400 };
+            }
+            if (!parsePortRange(node.portRange)) {
+                return { error: 'A valid portRange is required to configure port hopping', code: 400 };
             }
             emit('progress', { message: `Configuring port hopping on ${node.name}...` });
             const success = await getSyncService().setupPortHopping(node);

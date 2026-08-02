@@ -390,7 +390,7 @@ Agent is installed automatically during Xray node auto-setup.
 
 #### Ports
 - **Main port (443)** — Port Hysteria listens on
-- **Port hopping range (20000-50000)** — UDP ports for hopping
+- **Port hopping range (optional, e.g. 20000-50000)** — UDP ports for hopping; leave empty to disable
 - **Stats port (9999)** — Internal port for stats collection
 
 #### Domain vs SNI
@@ -907,6 +907,7 @@ volumes:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PANEL_DOMAIN` | ✅ | Panel domain |
+| `PANEL_IP` | ❌ | Comma-separated panel host IPv4/IPv6 addresses, used to prevent unsupported same-VPS port hopping when nodes use a different hostname |
 | `DOKPLOY_PANEL_HOST` | ❌ | Traefik host for Dokploy (`Host(...)` rule) |
 | `DOKPLOY_TRAEFIK_SERVICE_PORT` | ❌ | Traefik/backend service port in Dokploy (default: `3000`) |
 | `ACME_EMAIL` | ✅ | Let's Encrypt email |

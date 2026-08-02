@@ -11,6 +11,7 @@ const cryptoService = require('../services/cryptoService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
+const { normalizePortRange, parsePortRange, canonicalizePortRange } = require('../utils/portRange');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
 
@@ -48,6 +49,26 @@ async function startNodeRuntime(node) {
         return synced
             ? { success: true, attempted: true, service: 'xray', via: 'agent-sync' }
             : { success: false, attempted: true, service: 'xray', via: 'agent-sync', error: 'Node startup could not be confirmed' };
+    }
+
+    if (node.type === 'hysteria') {
+        const synced = await syncService.updateNodeConfig(node);
+        if (!synced) {
+            return { success: false, attempted: true, service: 'hysteria', via: 'config-sync', error: 'Hysteria config push failed' };
+        }
+
+        const desiredRange = nodeSetup.isSameVpsAsPanel(node) ? '' : node.portRange;
+        const firewallReady = await syncService.reconcilePortHopping(
+            node,
+            '',
+            node.port,
+            desiredRange,
+            { previousMainPortEnabled: false, desiredMainPortEnabled: true }
+        );
+        if (!firewallReady) {
+            return { success: false, attempted: true, service: 'hysteria', via: 'config-sync', error: 'Hysteria firewall setup failed' };
+        }
+        return { success: true, attempted: true, service: 'hysteria', via: 'config-sync' };
     }
 
     if (!hasSshCredentials(node)) {
@@ -243,6 +264,13 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 
         const nodeType = type || 'hysteria';
 
+        let normalizedPortRange;
+        try {
+            normalizedPortRange = canonicalizePortRange(portRange);
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+
         if (nodeType !== 'virtual' && !ip) {
             return res.status(400).json({ error: 'ip is required for hysteria and xray nodes' });
         }
@@ -293,7 +321,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             domain: domain || '',
             sni: sni || '',
             port: port || 443,
-            portRange: portRange || '20000-50000',
+            portRange: normalizedPortRange,
             statsPort: statsPort || 9999,
             statsSecret,
             groups: groups || [],
@@ -359,7 +387,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 router.put('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
         const allowedUpdates = [
-            'name', 'domain', 'sni', 'port', 'portRange', 'statsPort',
+            'name', 'ip', 'domain', 'sni', 'port', 'portRange', 'statsPort',
             'groups', 'ssh', 'paths', 'settings', 'active', 'rankingCoefficient',
             'type', 'xray', 'virtual', 'cascadeRole', 'country', 'comment',
             'hopInterval', 'acme', 'masquerade', 'bandwidth',
@@ -377,6 +405,12 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                     updates[key] = typeof req.body[key] === 'string'
                         ? req.body[key].trim().slice(0, 500)
                         : '';
+                } else if (key === 'portRange') {
+                    try {
+                        updates[key] = canonicalizePortRange(req.body[key]);
+                    } catch (error) {
+                        return res.status(400).json({ error: error.message });
+                    }
                 } else {
                     updates[key] = req.body[key];
                 }
@@ -386,7 +420,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
-        const existing = await HyNode.findById(req.params.id).select('type ip virtual').lean();
+        const existing = await HyNode.findById(req.params.id).select('type ip domain virtual port portRange active ssh').lean();
         if (!existing) {
             return res.status(404).json({ error: 'Node not found' });
         }
@@ -427,7 +461,15 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         }
 
         // Auto-push config to the node if any config-affecting field changed.
-        require('../services/syncService').schedulePush(node._id, updates);
+        require('../services/syncService').schedulePush(node._id, updates, {
+            previousPortRange: normalizePortRange(existing.portRange),
+            previousPort: existing.port,
+            previousType: existing.type,
+            previousIp: existing.ip,
+            previousDomain: existing.domain,
+            previousActive: existing.active,
+            previousSsh: existing.ssh,
+        });
 
         // Invalidate cache
         await invalidateNodesCache();
@@ -451,6 +493,8 @@ router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
         }
+
+        require('../services/syncService').schedulePortHoppingCleanup(node);
         
         // Remove the node from users' node lists
         await HyUser.updateMany(
@@ -693,6 +737,18 @@ router.post('/:id/setup-port-hopping', requireScope('nodes:write'), async (req, 
         
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
+        }
+
+        if (node.type !== 'hysteria') {
+            return res.status(400).json({ error: 'Port hopping is only supported for Hysteria nodes' });
+        }
+
+        if (nodeSetup.isSameVpsAsPanel(node)) {
+            return res.status(400).json({ error: 'Port hopping is not supported for same-VPS nodes' });
+        }
+
+        if (!parsePortRange(node.portRange)) {
+            return res.status(400).json({ error: 'A valid portRange is required to configure port hopping' });
         }
         
         const syncService = require('../services/syncService');

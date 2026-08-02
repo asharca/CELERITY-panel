@@ -270,7 +270,7 @@
     "commentHint": "Произвольная заметка, показывается в списке нод и на дашборде (до 500 символов)",
     "port": "Основной порт",
     "portRange": "Port Hopping диапазон",
-    "portRangeHint": "Клиенты будут подключаться на эти порты",
+    "portRangeHint": "Оставьте пустым, чтобы отключить Port Hopping; иначе клиенты будут подключаться к этим портам",
     "statsPort": "Порт API",
     "statsSecret": "Секрет API",
     "sectionStatsApi": "Stats API",
