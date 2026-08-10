@@ -514,6 +514,12 @@
         return port ? value + ':' + port : value;
     }
 
+    function formatRoute(inboundTag) {
+        const raw = String(inboundTag || '');
+        const hy2 = raw.match(/^hysteria2(?:\/([^/]+))?(?:\/session-[^/]+)?$/);
+        return hy2 ? (hy2[1] || 'main') : (raw || '—');
+    }
+
     function createCell(text, className) {
         const cell = document.createElement('td');
         if (className) cell.className = className;
@@ -546,6 +552,7 @@
         rows.forEach((event) => {
             const row = document.createElement('tr');
             row.appendChild(createCell(formatEventTime(event.ts), 'user-event-time'));
+            row.appendChild(createCell(formatRoute(event.inbound_tag), 'user-event-route'));
             row.appendChild(createCell(formatEndpoint(event.source_ip, event.source_port), 'user-event-endpoint'));
             row.appendChild(createCell(
                 formatEndpoint(event.dest_host || event.dest_ip, event.dest_port),

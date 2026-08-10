@@ -98,6 +98,15 @@
         return NODES[id] || id || '';
     }
 
+    // HY2 uses the inbound tag to carry the server runtime. UDP also appends
+    // a per-session suffix, which is useful in raw logs but too granular for
+    // a route column. Keep other protocols' inbound tags unchanged.
+    function routeName(inboundTag) {
+        const raw = String(inboundTag || '');
+        const hy2 = raw.match(/^hysteria2(?:\/([^/]+))?(?:\/session-[^/]+)?$/);
+        return hy2 ? (hy2[1] || 'main') : (raw || '—');
+    }
+
     // Collect filters from the form into a query string.
     function queryString() {
         const params = new URLSearchParams();
@@ -367,7 +376,7 @@
         for (const id of Object.keys(tables)) {
             const t = $(id); if (t) t.innerHTML = repeat(5, () => skelRow(tables[id]));
         }
-        const res = $('alResults'); if (res) res.innerHTML = repeat(6, () => skelRow(7));
+        const res = $('alResults'); if (res) res.innerHTML = repeat(6, () => skelRow(8));
     }
 
     // ─── Loaders ─────────────────────────────────────────────────────────────
@@ -426,6 +435,7 @@
                 return `<tr>
                     <td class="hint" style="white-space:nowrap;">${esc(fmtTime(r.ts))}</td>
                     <td>${esc(nodeName(r.node_id))}</td>
+                    <td class="al-mono al-trunc" title="${esc(r.inbound_tag || '')}">${esc(routeName(r.inbound_tag))}</td>
                     <td>${esc(r.email || '')}</td>
                     <td class="al-mono">${esc(src)}</td>
                     <td class="al-mono al-trunc" title="${esc(dest)}">${esc(dest)}</td>
