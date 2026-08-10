@@ -1,4 +1,12 @@
-<% const viewDateLocale = typeof dateLocale !== 'undefined' ? dateLocale : undefined; %>
+<%
+    const viewDateLocale = typeof dateLocale !== 'undefined' ? dateLocale : undefined;
+    const jsonForScript = (value) => JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+%>
 <div class="page-header">
     <a href="/panel/users" class="btn btn-back"><i class="ti ti-chevron-left"></i> <%= t('common.backToList') %></a>
 </div>
@@ -207,17 +215,238 @@
     </div>
 </div>
 
+<section class="card user-insights" id="userInsights" aria-labelledby="userInsightsTitle">
+    <div class="user-insights-header">
+        <div class="user-insights-heading">
+            <span class="user-insights-icon" aria-hidden="true"><i class="ti ti-chart-histogram"></i></span>
+            <div>
+                <h2 id="userInsightsTitle"><%= t('userInsights.title') %></h2>
+                <p><%= t('userInsights.description') %></p>
+            </div>
+        </div>
+        <div class="user-insights-tabs" role="tablist" aria-label="<%= t('userInsights.tablistLabel') %>">
+            <button type="button" class="user-insights-tab active" id="userTrafficTab"
+                    role="tab" aria-selected="true" aria-controls="userTrafficPanel" tabindex="0">
+                <i class="ti ti-chart-area-line" aria-hidden="true"></i>
+                <span><%= t('userInsights.trafficTab') %></span>
+            </button>
+            <button type="button" class="user-insights-tab" id="userAccessTab"
+                    role="tab" aria-selected="false" aria-controls="userAccessPanel" tabindex="-1">
+                <i class="ti ti-list-search" aria-hidden="true"></i>
+                <span><%= t('userInsights.accessTab') %></span>
+            </button>
+        </div>
+    </div>
+
+    <p class="ui-visually-hidden" id="userInsightsStatus" role="status" aria-live="polite"></p>
+
+    <div class="user-insights-panel" id="userTrafficPanel" role="tabpanel"
+         aria-labelledby="userTrafficTab" aria-busy="true">
+        <div class="user-insights-toolbar">
+            <div class="user-insights-context">
+                <h3><%= t('userInsights.trendTitle') %></h3>
+                <p id="trafficPeriod"><%= t('userInsights.loadingTraffic') %></p>
+            </div>
+            <div class="traffic-range" role="group" aria-label="<%= t('userInsights.rangeLabel') %>">
+                <button type="button" class="traffic-range-btn" data-range="24h" aria-pressed="false">24h</button>
+                <button type="button" class="traffic-range-btn active" data-range="7d" aria-pressed="true">7d</button>
+                <button type="button" class="traffic-range-btn" data-range="30d" aria-pressed="false">30d</button>
+            </div>
+        </div>
+
+        <div class="user-insights-skeleton" id="trafficSkeleton" aria-hidden="true">
+            <div class="insights-metrics insights-metrics-skeleton">
+                <span class="ui-skeleton"></span><span class="ui-skeleton"></span><span class="ui-skeleton"></span>
+            </div>
+            <div class="insights-skeleton-grid">
+                <span class="ui-skeleton ui-skeleton-chart"></span>
+                <span class="ui-skeleton ui-skeleton-list"></span>
+            </div>
+        </div>
+
+        <div class="insights-state insights-state-error" id="trafficError" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-cloud-off"></i></span>
+            <div>
+                <h3><%= t('userInsights.trafficErrorTitle') %></h3>
+                <p><%= t('userInsights.trafficErrorDescription') %></p>
+                <button type="button" class="btn btn-sm" id="trafficRetry">
+                    <i class="ti ti-refresh" aria-hidden="true"></i> <%= t('userInsights.retry') %>
+                </button>
+            </div>
+        </div>
+
+        <div id="trafficContent" hidden>
+            <dl class="insights-metrics" aria-label="<%= t('userInsights.periodSummary') %>">
+                <div class="insights-metric insights-metric-total">
+                    <dt><span class="metric-dot metric-dot-total" aria-hidden="true"></span><%= t('userInsights.totalTraffic') %></dt>
+                    <dd id="trafficTotal">—</dd>
+                </div>
+                <div class="insights-metric">
+                    <dt><span class="metric-dot metric-dot-tx" aria-hidden="true"></span><%= t('userInsights.uploaded') %></dt>
+                    <dd id="trafficTx">—</dd>
+                </div>
+                <div class="insights-metric">
+                    <dt><span class="metric-dot metric-dot-rx" aria-hidden="true"></span><%= t('userInsights.downloaded') %></dt>
+                    <dd id="trafficRx">—</dd>
+                </div>
+            </dl>
+
+            <div class="insights-state" id="trafficEmpty" hidden>
+                <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-chart-line"></i></span>
+                <div>
+                    <h3><%= t('userInsights.trafficEmptyTitle') %></h3>
+                    <p><%= t('userInsights.trafficEmptyDescription') %></p>
+                </div>
+            </div>
+
+            <div class="user-insights-visuals" id="trafficVisuals">
+                <section class="insights-visual insights-chart-section" aria-labelledby="trafficChartTitle">
+                    <div class="insights-visual-header">
+                        <div>
+                            <h3 id="trafficChartTitle"><%= t('userInsights.trendTitle') %></h3>
+                            <p id="trafficGranularity"><%= t('userInsights.hourly') %></p>
+                        </div>
+                        <div class="traffic-legend" aria-label="<%= t('userInsights.chartLegend') %>">
+                            <span><i class="legend-line legend-line-tx" aria-hidden="true"></i><%= t('userInsights.uploaded') %></span>
+                            <span><i class="legend-line legend-line-rx" aria-hidden="true"></i><%= t('userInsights.downloaded') %></span>
+                        </div>
+                    </div>
+                    <div class="traffic-chart" id="trafficChart"></div>
+                    <div class="insights-inline-empty" id="trafficChartEmpty" hidden>
+                        <i class="ti ti-chart-dots" aria-hidden="true"></i>
+                        <span><%= t('userInsights.noTrendPoints') %></span>
+                    </div>
+                </section>
+
+                <section class="insights-visual insights-nodes-section" aria-labelledby="trafficNodesTitle">
+                    <div class="insights-visual-header">
+                        <div>
+                            <h3 id="trafficNodesTitle"><%= t('userInsights.nodeDistribution') %></h3>
+                            <p><%= t('userInsights.nodeDistributionHint') %></p>
+                        </div>
+                    </div>
+                    <div class="traffic-node-list" id="trafficNodes"></div>
+                    <div class="insights-inline-empty" id="trafficNodesEmpty" hidden>
+                        <i class="ti ti-server-off" aria-hidden="true"></i>
+                        <span><%= t('userInsights.noNodeBreakdown') %></span>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <div class="user-insights-panel" id="userAccessPanel" role="tabpanel"
+         aria-labelledby="userAccessTab" aria-busy="false" hidden>
+        <div class="user-insights-toolbar">
+            <div class="user-insights-context">
+                <h3><%= t('userInsights.recentEvents') %></h3>
+                <p><%= t('userInsights.accessSubtitle') %></p>
+            </div>
+            <a href="/panel/access-logs?email=<%= encodeURIComponent(user.userId) %>" class="btn btn-sm">
+                <i class="ti ti-external-link" aria-hidden="true"></i> <%= t('userInsights.openAccessLogs') %>
+            </a>
+        </div>
+
+        <div class="user-insights-skeleton" id="accessSkeleton" aria-hidden="true" hidden>
+            <div class="insights-metrics insights-metrics-skeleton">
+                <span class="ui-skeleton"></span><span class="ui-skeleton"></span><span class="ui-skeleton"></span>
+            </div>
+            <span class="ui-skeleton ui-skeleton-table"></span>
+        </div>
+
+        <div class="insights-state insights-state-warning" id="accessDisabled" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-list-search"></i></span>
+            <div>
+                <h3><%= t('userInsights.accessDisabledTitle') %></h3>
+                <p><%= t('userInsights.accessDisabledDescription') %></p>
+                <a href="/panel/settings?tab=accessLogs" class="btn btn-sm btn-primary">
+                    <i class="ti ti-settings" aria-hidden="true"></i> <%= t('userInsights.enableInSettings') %>
+                </a>
+            </div>
+        </div>
+
+        <div class="insights-state insights-state-warning" id="accessDegraded" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-database-off"></i></span>
+            <div>
+                <h3><%= t('userInsights.accessDegradedTitle') %></h3>
+                <p><%= t('userInsights.accessDegradedDescription') %></p>
+                <a href="/panel/settings?tab=accessLogs" class="btn btn-sm btn-primary">
+                    <i class="ti ti-database-cog" aria-hidden="true"></i> <%= t('userInsights.configureClickHouse') %>
+                </a>
+            </div>
+        </div>
+
+        <div class="insights-state insights-state-error" id="accessError" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-cloud-off"></i></span>
+            <div>
+                <h3><%= t('userInsights.accessErrorTitle') %></h3>
+                <p><%= t('userInsights.accessErrorDescription') %></p>
+                <button type="button" class="btn btn-sm" id="accessRetry">
+                    <i class="ti ti-refresh" aria-hidden="true"></i> <%= t('userInsights.retry') %>
+                </button>
+            </div>
+        </div>
+
+        <div id="accessContent" hidden>
+            <dl class="insights-metrics" aria-label="<%= t('userInsights.accessSummary') %>">
+                <div class="insights-metric insights-metric-total">
+                    <dt><span class="metric-dot metric-dot-total" aria-hidden="true"></span><%= t('userInsights.events') %></dt>
+                    <dd id="accessEvents">—</dd>
+                </div>
+                <div class="insights-metric">
+                    <dt><span class="metric-dot metric-dot-rx" aria-hidden="true"></span><%= t('userInsights.sourceIps') %></dt>
+                    <dd id="accessIps">—</dd>
+                </div>
+                <div class="insights-metric">
+                    <dt><span class="metric-dot metric-dot-tx" aria-hidden="true"></span><%= t('userInsights.destinations') %></dt>
+                    <dd id="accessDestinations">—</dd>
+                </div>
+            </dl>
+
+            <div class="insights-state" id="accessEmpty" hidden>
+                <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-route-off"></i></span>
+                <div>
+                    <h3><%= t('userInsights.accessEmptyTitle') %></h3>
+                    <p><%= t('userInsights.accessEmptyDescription') %></p>
+                </div>
+            </div>
+
+            <div class="user-access-events" id="accessEventsWrap">
+                <div class="access-events-heading">
+                    <h3><%= t('userInsights.recentEvents') %></h3>
+                    <span><%= t('userInsights.recentEventsHint') %></span>
+                </div>
+                <div class="user-access-table-wrap" tabindex="0" role="region" aria-label="<%= t('userInsights.recentEvents') %>">
+                    <table class="user-access-table">
+                        <caption class="ui-visually-hidden"><%= t('userInsights.recentEvents') %></caption>
+                        <thead>
+                            <tr>
+                                <th scope="col"><%= t('userInsights.columnTime') %></th>
+                                <th scope="col"><%= t('userInsights.columnSource') %></th>
+                                <th scope="col"><%= t('userInsights.columnDestination') %></th>
+                                <th scope="col"><%= t('userInsights.columnProtocol') %></th>
+                                <th scope="col"><%= t('userInsights.columnAction') %></th>
+                            </tr>
+                        </thead>
+                        <tbody id="accessEventRows"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 
 <script>
-const userId = <%- JSON.stringify(user.userId) %>;
+const userId = <%- jsonForScript(user.userId) %>;
 const i18n = {
-    error: <%- JSON.stringify(t("common.error")) %>,
-    confirmDelete: <%- JSON.stringify(t("users.confirmDelete")) %> + ' ' + userId + '?',
-    linkCopied: <%- JSON.stringify(t("users.linkCopied")) %>,
-    confirmUnlinkHwid: <%- JSON.stringify(t("users.confirmUnlinkHwid")) %>,
-    confirmUnlinkAllHwid: <%- JSON.stringify(t("users.confirmUnlinkAllHwid")) %>,
-    confirmResetTraffic: <%- JSON.stringify(t("users.confirmResetTraffic")) %>,
+    error: <%- jsonForScript(t("common.error")) %>,
+    confirmDelete: <%- jsonForScript(t("users.confirmDelete")) %> + ' ' + userId + '?',
+    linkCopied: <%- jsonForScript(t("users.linkCopied")) %>,
+    confirmUnlinkHwid: <%- jsonForScript(t("users.confirmUnlinkHwid")) %>,
+    confirmUnlinkAllHwid: <%- jsonForScript(t("users.confirmUnlinkAllHwid")) %>,
+    confirmResetTraffic: <%- jsonForScript(t("users.confirmResetTraffic")) %>,
 };
 
 async function unlinkHwid(hwid) {
@@ -301,3 +530,30 @@ QRCode.toCanvas(document.createElement('canvas'), subUrl, { width: 180, margin: 
     if (!err) document.getElementById('qrcode').appendChild(canvas);
 });
 </script>
+
+<script>
+window.__USER_INSIGHTS__ = {
+    userId: <%- jsonForScript(user.userId) %>,
+    i18n: {
+        loadingTraffic: <%- jsonForScript(t('userInsights.loadingTraffic')) %>,
+        loadingAccess: <%- jsonForScript(t('userInsights.loadingAccess')) %>,
+        trafficLoaded: <%- jsonForScript(t('userInsights.trafficLoaded')) %>,
+        accessLoaded: <%- jsonForScript(t('userInsights.accessLoaded')) %>,
+        currentPeriod: <%- jsonForScript(t('userInsights.currentPeriod')) %>,
+        hourly: <%- jsonForScript(t('userInsights.hourly')) %>,
+        daily: <%- jsonForScript(t('userInsights.daily')) %>,
+        chartAria: <%- jsonForScript(t('userInsights.chartAria')) %>,
+        uploaded: <%- jsonForScript(t('userInsights.uploaded')) %>,
+        downloaded: <%- jsonForScript(t('userInsights.downloaded')) %>,
+        totalTraffic: <%- jsonForScript(t('userInsights.totalTraffic')) %>,
+        unknownNode: <%- jsonForScript(t('userInsights.unknownNode')) %>,
+        nodeTrafficAria: <%- jsonForScript(t('userInsights.nodeTrafficAria')) %>,
+        accepted: <%- jsonForScript(t('userInsights.accepted')) %>,
+        rejected: <%- jsonForScript(t('userInsights.rejected')) %>,
+        blocked: <%- jsonForScript(t('userInsights.blocked')) %>,
+        unknownAction: <%- jsonForScript(t('userInsights.unknownAction')) %>,
+        error: <%- jsonForScript(t('common.error')) %>
+    }
+};
+</script>
+<script defer src="/js/user-insights.js"></script>

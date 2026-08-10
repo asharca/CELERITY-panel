@@ -119,6 +119,30 @@
         return params.toString();
     }
 
+    // Allow other panel surfaces (notably a user's detail page) to deep-link to
+    // a pre-filtered log view. datetime-local inputs need a local wall-clock
+    // value even though the shared URL carries an absolute ISO timestamp.
+    function hydrateFiltersFromLocation() {
+        const params = new URLSearchParams(window.location.search);
+        const map = {
+            from: 'alFrom', to: 'alTo', nodeId: 'alNode', email: 'alEmail',
+            sourceIp: 'alSourceIp', destination: 'alDest', network: 'alNetwork', action: 'alAction',
+        };
+        for (const [key, id] of Object.entries(map)) {
+            const value = params.get(key);
+            const el = $(id);
+            if (!value || !el) continue;
+            if (key === 'from' || key === 'to') {
+                const date = new Date(value);
+                if (Number.isNaN(date.getTime())) continue;
+                const local = new Date(date.getTime() - date.getTimezoneOffset() * 60 * 1000);
+                el.value = local.toISOString().slice(0, 16);
+            } else {
+                el.value = value;
+            }
+        }
+    }
+
     // ─── Busy indicator ──────────────────────────────────────────────────────
     // A reference-counted busy state drives the top progress bar and the search
     // button spinner, so any in-flight request (analytics, search, status, the
@@ -481,6 +505,7 @@
     }
 
     if (enabled) {
+        hydrateFiltersFromLocation();
         setDefaultRange();
         paintSkeletons();
         refreshAll();

@@ -28,6 +28,8 @@ const webhook = require('./webhookService');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 const { normalizePortRange, parsePortRange } = require('../utils/portRange');
+const userTrafficHistory = require('./userTrafficHistoryService');
+const { normalizeByteCount } = userTrafficHistory;
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -710,17 +712,18 @@ class SyncService {
             const data = response.data || {};
             const users = data.users || {};
             const nodeTraffic = data.node || { tx: 0, rx: 0 };
-            const nodeTx = nodeTraffic.tx || 0;
-            const nodeRx = nodeTraffic.rx || 0;
+            const nodeTx = normalizeByteCount(nodeTraffic.tx);
+            const nodeRx = normalizeByteCount(nodeTraffic.rx);
 
             const userEntries = Object.entries(users);
             const bulkOps = [];
+            const trafficDeltas = [];
             const now = new Date();
 
             for (const [email, traffic] of userEntries) {
-                const tx = traffic.tx || 0;
-                const rx = traffic.rx || 0;
-                if (tx === 0 && rx === 0) continue;
+                const tx = normalizeByteCount(traffic?.tx);
+                const rx = normalizeByteCount(traffic?.rx);
+                if (!email || (tx === 0 && rx === 0)) continue;
 
                 // email == userId (as set in configGenerator and agent)
                 bulkOps.push({
@@ -732,12 +735,27 @@ class SyncService {
                         },
                     },
                 });
+                trafficDeltas.push({ userId: email, tx, rx });
             }
 
             if (bulkOps.length > 0) {
                 const result = await HyUser.bulkWrite(bulkOps, { ordered: false });
                 logger.debug(`[Agent Stats] ${node.name}: updated ${result.modifiedCount}/${bulkOps.length} users`);
-                this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
+                this.enforceTrafficLimit(trafficDeltas.map(delta => delta.userId)).catch(() => {});
+
+                try {
+                    await userTrafficHistory.recordUserTrafficDeltas({
+                        nodeId: node._id,
+                        nodeName: node.name,
+                        nodeType: node.type,
+                        timestamp: now,
+                        deltas: trafficDeltas,
+                    });
+                } catch (historyError) {
+                    // The live counters have already moved, so history failure
+                    // must not prevent node health/traffic fields from updating.
+                    logger.error(`[Agent Stats] ${node.name}: traffic history error: ${historyError.message}`);
+                }
             }
 
             // Online = users with non-zero traffic in the last poll interval.
@@ -1207,7 +1225,9 @@ class SyncService {
                 timeout: 10000,
             });
             
-            const stats = response.data;
+            const stats = response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+                ? response.data
+                : {};
             
             // Sum node traffic
             let nodeTx = 0;
@@ -1215,24 +1235,30 @@ class SyncService {
             
             // Prepare bulk operations for all users
             const bulkOps = [];
+            const trafficDeltas = [];
             const now = new Date();
             
             for (const [userId, traffic] of Object.entries(stats)) {
-                nodeTx += traffic.tx || 0;
-                nodeRx += traffic.rx || 0;
+                const tx = normalizeByteCount(traffic?.tx);
+                const rx = normalizeByteCount(traffic?.rx);
+                if (!userId || (tx === 0 && rx === 0)) continue;
+
+                nodeTx += tx;
+                nodeRx += rx;
                 
                 bulkOps.push({
                     updateOne: {
                         filter: { userId },
                         update: {
                             $inc: {
-                                'traffic.tx': traffic.tx || 0,
-                                'traffic.rx': traffic.rx || 0,
+                                'traffic.tx': tx,
+                                'traffic.rx': rx,
                             },
                             $set: { 'traffic.lastUpdate': now }
                         }
                     }
                 });
+                trafficDeltas.push({ userId, tx, rx });
             }
             
             // Execute bulk update (1 query instead of N)
@@ -1241,7 +1267,19 @@ class SyncService {
                 logger.debug(`[Stats] ${node.name}: Bulk updated ${result.modifiedCount}/${bulkOps.length} users`);
 
                 // Enforce traffic limits on users whose counters just moved (fire-and-forget).
-                this.enforceTrafficLimit(Object.keys(stats)).catch(() => {});
+                this.enforceTrafficLimit(trafficDeltas.map(delta => delta.userId)).catch(() => {});
+
+                try {
+                    await userTrafficHistory.recordUserTrafficDeltas({
+                        nodeId: node._id,
+                        nodeName: node.name,
+                        nodeType: node.type,
+                        timestamp: now,
+                        deltas: trafficDeltas,
+                    });
+                } catch (historyError) {
+                    logger.error(`[Stats] ${node.name}: traffic history error: ${historyError.message}`);
+                }
             }
             
             // Update node traffic

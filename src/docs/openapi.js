@@ -481,6 +481,29 @@ function addCommonExamples(target) {
                 devices: [{ hwid: 'abc123', platform: 'Android', lastSeenAt: '2026-05-18T17:00:00.000Z' }],
             },
         },
+        UserTrafficHistoryResponse: {
+            summary: 'Per-account traffic history',
+            value: {
+                userId: '123456789',
+                range: '24h',
+                granularity: 'hour',
+                from: '2026-05-17T18:00:00.000Z',
+                to: '2026-05-18T18:00:00.000Z',
+                totals: { tx: 1048576, rx: 8388608, total: 9437184 },
+                series: [
+                    { ts: '2026-05-17T18:00:00.000Z', tx: 0, rx: 0, total: 0 },
+                    { ts: '2026-05-17T19:00:00.000Z', tx: 1048576, rx: 8388608, total: 9437184 },
+                ],
+                nodes: [{
+                    nodeId: '64a1b2c3d4e5f6a7b8c9d0e2',
+                    nodeName: 'Germany 1',
+                    nodeType: 'xray',
+                    tx: 1048576,
+                    rx: 8388608,
+                    total: 9437184,
+                }],
+            },
+        },
         CascadeDeployResponse: {
             summary: 'Cascade link deployed',
             value: { success: true, message: 'Cascade link deployed' },
@@ -556,6 +579,7 @@ const OPERATION_METADATA = {
     'GET /users/{userId}': { scopes: ['users:read'], responseExample: 'UserResponse' },
     'PUT /users/{userId}': { scopes: ['users:write'], requestExample: 'UserUpdateRequest', responseExample: 'UserResponse' },
     'DELETE /users/{userId}': { scopes: ['users:write'], responseExample: 'SuccessWithMessageResponse' },
+    'GET /users/{userId}/traffic-history': { scopes: ['users:read'], responseExample: 'UserTrafficHistoryResponse' },
     'GET /users/{userId}/devices': { scopes: ['users:read'], responseExample: 'UserDeviceListExample' },
     'DELETE /users/{userId}/devices': { scopes: ['users:write'], responseExample: 'SuccessResponse' },
     'DELETE /users/{userId}/devices/{hwid}': { scopes: ['users:write'], responseExample: 'SuccessResponse' },
@@ -971,6 +995,55 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     count:   { type: 'integer' },
                     limit:   { type: 'integer', description: 'Effective maxDevices for HWID (same rules as auth)' },
                     devices: { type: 'array', items: { $ref: '#/components/schemas/UserDevice' } },
+                },
+            },
+            UserTrafficTotals: {
+                type: 'object',
+                required: ['tx', 'rx', 'total'],
+                properties: {
+                    tx:    { type: 'integer', format: 'int64', minimum: 0, description: 'Bytes uploaded in the selected period' },
+                    rx:    { type: 'integer', format: 'int64', minimum: 0, description: 'Bytes downloaded in the selected period' },
+                    total: { type: 'integer', format: 'int64', minimum: 0, description: 'Uploaded plus downloaded bytes' },
+                },
+            },
+            UserTrafficPoint: {
+                allOf: [
+                    { $ref: '#/components/schemas/UserTrafficTotals' },
+                    {
+                        type: 'object',
+                        required: ['ts'],
+                        properties: {
+                            ts: { type: 'string', format: 'date-time', description: 'UTC bucket start' },
+                        },
+                    },
+                ],
+            },
+            UserTrafficNode: {
+                allOf: [
+                    { $ref: '#/components/schemas/UserTrafficTotals' },
+                    {
+                        type: 'object',
+                        required: ['nodeId', 'nodeName', 'nodeType'],
+                        properties: {
+                            nodeId:   { type: 'string' },
+                            nodeName: { type: 'string' },
+                            nodeType: { type: 'string' },
+                        },
+                    },
+                ],
+            },
+            UserTrafficHistoryResponse: {
+                type: 'object',
+                required: ['userId', 'range', 'granularity', 'from', 'to', 'totals', 'series', 'nodes'],
+                properties: {
+                    userId:      { type: 'string' },
+                    range:       { type: 'string', enum: ['24h', '7d', '30d'] },
+                    granularity: { type: 'string', enum: ['hour', 'day'] },
+                    from:        { type: 'string', format: 'date-time', description: 'Inclusive UTC range boundary' },
+                    to:          { type: 'string', format: 'date-time', description: 'Exclusive UTC range boundary' },
+                    totals:      { $ref: '#/components/schemas/UserTrafficTotals' },
+                    series:      { type: 'array', items: { $ref: '#/components/schemas/UserTrafficPoint' }, description: 'Dense UTC buckets, including zero-value buckets' },
+                    nodes:       { type: 'array', items: { $ref: '#/components/schemas/UserTrafficNode' }, description: 'Selected-period totals grouped by node' },
                 },
             },
             Node: {
@@ -1810,6 +1883,31 @@ These endpoints are not under \`/api\` and are not part of this specification:
                 summary: 'Delete user',
                 responses: {
                     200: { description: 'Deleted', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, message: { type: 'string' } } } } } },
+                    401: { $ref: '#/components/responses/Unauthorized' },
+                    403: { $ref: '#/components/responses/Forbidden' },
+                    404: { $ref: '#/components/responses/NotFound' },
+                },
+            },
+        },
+
+        '/users/{userId}/traffic-history': {
+            parameters: [{ $ref: '#/components/parameters/userId' }],
+            get: {
+                tags: ['Users'],
+                summary: 'Get per-account traffic history',
+                description: 'Returns dense UTC buckets collected from Hysteria and Xray, plus selected-period totals grouped by node. The `to` boundary is exclusive. History starts when collection is deployed, is retained for at least 45 days, and is not cleared by the cumulative traffic reset.',
+                parameters: [{
+                    name: 'range',
+                    in: 'query',
+                    schema: { type: 'string', enum: ['24h', '7d', '30d'], default: '24h' },
+                    description: '`24h` returns 24 hourly buckets; `7d` and `30d` return UTC daily buckets.',
+                }],
+                responses: {
+                    200: {
+                        description: 'Dense traffic timeline and node breakdown',
+                        content: { 'application/json': { schema: { $ref: '#/components/schemas/UserTrafficHistoryResponse' } } },
+                    },
+                    400: { $ref: '#/components/responses/BadRequest' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },

@@ -16,6 +16,9 @@ const { recomputeEnabled } = require('../utils/userActivity');
 const expireScheduler = require('../services/expireScheduler');
 const { requireScope } = require('../middleware/auth');
 const webhook = require('../services/webhookService');
+const userTrafficHistory = require('../services/userTrafficHistoryService');
+
+const VALID_TRAFFIC_HISTORY_RANGES = new Set(['24h', '7d', '30d']);
 
 /**
  * Lazy-load syncService to avoid circular dependency
@@ -47,6 +50,16 @@ async function deleteUserById(userId) {
 
     if (!user) {
         return { deleted: false };
+    }
+
+    // History is privacy-sensitive and no longer useful after the subscription
+    // account is removed. Keep deletion best-effort so a transient history DB
+    // error cannot turn an already-completed user deletion into a misleading
+    // 500 response; the TTL index remains the final cleanup safety net.
+    try {
+        await userTrafficHistory.deleteUserTrafficHistory(userId);
+    } catch (error) {
+        logger.warn(`[Users API] Failed to delete traffic history for ${userId}: ${error.message}`);
     }
 
     await UserDevice.deleteMany({ userId });
@@ -152,6 +165,41 @@ router.get('/', requireScope('users:read'), async (req, res) => {
         });
     } catch (error) {
         logger.error(`[Users API] List error: ${error.message}`);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/**
+ * GET /users/:userId/traffic-history — per-subscription traffic timeline
+ */
+router.get('/:userId/traffic-history', requireScope('users:read'), async (req, res) => {
+    try {
+        const range = typeof req.query.range === 'string' ? req.query.range : '24h';
+
+        // Validate before querying the user so malformed requests consistently
+        // receive a 400 instead of depending on whether that user exists.
+        if (!VALID_TRAFFIC_HISTORY_RANGES.has(range)) {
+            return res.status(400).json({
+                error: 'Invalid range. Expected one of: 24h, 7d, 30d',
+            });
+        }
+
+        const user = await HyUser.findOne({ userId: req.params.userId })
+            .select('userId')
+            .lean();
+        if (!user) {
+            return res.status(404).json({ error: 'Пользователь не найден' });
+        }
+
+        const history = await userTrafficHistory.getUserHistory(user.userId, range);
+        res.json(history);
+    } catch (error) {
+        if (error.code === 'INVALID_TRAFFIC_HISTORY_RANGE') {
+            return res.status(400).json({
+                error: 'Invalid range. Expected one of: 24h, 7d, 30d',
+            });
+        }
+        logger.error(`[Users API] Traffic history error for ${req.params.userId}: ${error.message}`);
         res.status(500).json({ error: error.message });
     }
 });

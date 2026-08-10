@@ -521,6 +521,7 @@ Required scope: `users:read` (GET) / `users:write` (POST, PUT, DELETE)
 |--------|----------|-------------|
 | GET | `/api/users` | List users (pagination, filtering, sorting) |
 | GET | `/api/users/:userId` | Get user |
+| GET | `/api/users/:userId/traffic-history` | Per-account traffic history (`range=24h\|7d\|30d`) |
 | POST | `/api/users` | Create user |
 | PUT | `/api/users/:userId` | Update user |
 | DELETE | `/api/users/:userId` | Delete user |
@@ -530,6 +531,8 @@ Required scope: `users:read` (GET) / `users:write` (POST, PUT, DELETE)
 | POST | `/api/users/:userId/groups` | Add user to groups |
 | DELETE | `/api/users/:userId/groups/:groupId` | Remove user from group |
 | POST | `/api/users/sync-from-main` | Sync from external DB |
+
+Traffic history starts accumulating after this version is deployed. It is collected from both Hysteria and Xray every stats poll, retained for at least 45 days, and returned as dense UTC buckets with a per-node breakdown. Resetting a user's cumulative traffic counter does not erase this history; deleting the user does.
 
 ### Nodes
 
