@@ -19,8 +19,10 @@ const logger = require('../../utils/logger');
 const appConfig = require('../../../config');
 const credentialService = require('./credentialService');
 
-const MIN_AGENT_VERSION = '1.5.1';
-const MIN_HYSTERIA_AGENT_VERSION = '1.5.1';
+const MIN_AGENT_VERSION = '1.5.2';
+const MIN_HYSTERIA_AGENT_VERSION = '1.5.2';
+const HYSTERIA_JOURNAL_UNIT_RE = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$/;
+const HYSTERIA_JOURNAL_TAG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 // Minimal semver-ish compare good enough for "x.y.z" agent versions. Missing or
 // unparseable versions are treated as too old.
@@ -104,7 +106,7 @@ async function waitForAccessLogAgentSourceReady(node, expected, options = {}) {
             && status.enabled === true
             && status.source === expected.source
             && status.format === expected.format
-            && (expected.source !== 'journal' || status.journal_unit === expected.journalUnit);
+            && journalSourceStatusMatches(status, expected);
         if (matches && status.source_ready === true && !status.source_error) return probe;
         lastError = status.source_error
             || (!probe.reachable ? 'agent is unreachable' : `source status is ready=${status.source_ready === true}`);
@@ -115,16 +117,68 @@ async function waitForAccessLogAgentSourceReady(node, expected, options = {}) {
     throw new Error(`cc-agent access-log source not ready: ${lastError}`);
 }
 
+function normalizeHysteriaJournalSources(accessLogs = {}) {
+    const configured = Array.isArray(accessLogs?.journalSources)
+        ? accessLogs.journalSources : [];
+    const fallbackUnit = String(
+        accessLogs?.journalUnit || require('../configGenerator').HYSTERIA_SYSTEMD_UNIT
+    ).trim();
+    const sources = configured.length > 0
+        ? configured.map(source => ({
+            unit: String(source?.unit || '').trim(),
+            tag: String(source?.tag || '').trim(),
+        }))
+        : [{ unit: fallbackUnit, tag: '' }];
+    const seenUnits = new Set();
+    const seenTags = new Set();
+    for (const source of sources) {
+        if (!HYSTERIA_JOURNAL_UNIT_RE.test(source.unit) || source.unit.includes('..')) {
+            throw new Error(`Invalid Hysteria journal systemd unit: ${source.unit || '(empty)'}`);
+        }
+        if (sources.length > 1 && !source.tag) {
+            throw new Error(`Hysteria journal source ${source.unit} needs a runtime tag`);
+        }
+        if (source.tag && !HYSTERIA_JOURNAL_TAG_RE.test(source.tag)) {
+            throw new Error(`Invalid Hysteria journal runtime tag: ${source.tag}`);
+        }
+        if (seenUnits.has(source.unit)) {
+            throw new Error(`Duplicate Hysteria journal systemd unit: ${source.unit}`);
+        }
+        if (source.tag && seenTags.has(source.tag)) {
+            throw new Error(`Duplicate Hysteria journal runtime tag: ${source.tag}`);
+        }
+        seenUnits.add(source.unit);
+        if (source.tag) seenTags.add(source.tag);
+    }
+    return sources;
+}
+
+function journalSourceStatusMatches(status, expected) {
+    if (expected.source !== 'journal') return true;
+    const expectedSources = Array.isArray(expected.journalSources) && expected.journalSources.length > 0
+        ? expected.journalSources : [{ unit: expected.journalUnit || '', tag: '' }];
+    const reported = Array.isArray(status?.journal_sources) && status.journal_sources.length > 0
+        ? status.journal_sources.map(source => ({
+            unit: String(source?.unit || ''),
+            tag: String(source?.tag || ''),
+        }))
+        : [{ unit: String(status?.journal_unit || ''), tag: '' }];
+    return expectedSources.length === reported.length
+        && expectedSources.every((source, index) => source.unit === reported[index].unit
+            && source.tag === reported[index].tag);
+}
+
 // Source-specific fields consumed by cc-agent. Xray keeps its established file
 // tailer; Hysteria reads the official systemd unit and normalizes JSON events
 // before sending them through the same ingest endpoint.
 function accessLogSourceForNode(node) {
     if (node?.type === 'hysteria') {
+        const journalSources = normalizeHysteriaJournalSources(node.xray?.accessLogs || {});
         return {
             source: 'journal',
             format: 'hysteria2-json',
-            journalUnit: node.xray?.accessLogs?.journalUnit
-                || require('../configGenerator').HYSTERIA_SYSTEMD_UNIT,
+            journalUnit: journalSources[0].unit,
+            journalSources,
             path: '',
         };
     }
@@ -204,7 +258,7 @@ function desiredFingerprint(shouldShip, settings, tokenHash, node) {
     const insecureTls = !!(settings?.nodeAuth?.insecure);
     const source = accessLogSourceForNode(node);
     return crypto.createHash('sha256')
-        .update('v3|enabled|')
+        .update('v4|enabled|')
         .update(String(ingestUrl))
         .update('|')
         .update(String(tokenHash || ''))
@@ -216,6 +270,8 @@ function desiredFingerprint(shouldShip, settings, tokenHash, node) {
         .update(String(source.format))
         .update('|')
         .update(String(source.journalUnit))
+        .update('|')
+        .update(JSON.stringify(source.journalSources || []))
         .update('|')
         .update(String(source.path))
         .digest('hex')
@@ -268,6 +324,9 @@ function mergeRuntimeAccessLogs(current = {}, previous = {}) {
         }
     }
     if (!previous.journalUnit) merged.journalUnit = current.journalUnit || '';
+    if (!Array.isArray(previous.journalSources) || previous.journalSources.length === 0) {
+        merged.journalSources = current.journalSources || previous.journalSources || [];
+    }
     return merged;
 }
 
@@ -720,8 +779,7 @@ async function reconcileNode(node, settings, options = {}) {
             && liveAgent.accessLogs?.enabled === true
             && liveAgent.accessLogs?.source === expectedSource.source
             && liveAgent.accessLogs?.format === expectedSource.format
-            && (expectedSource.source !== 'journal'
-                || liveAgent.accessLogs?.journal_unit === expectedSource.journalUnit)
+            && journalSourceStatusMatches(liveAgent.accessLogs, expectedSource)
             && liveAgent.accessLogs?.source_ready === true
             && !liveAgent.accessLogs?.source_error
         );
@@ -952,9 +1010,17 @@ async function reconcileNode(node, settings, options = {}) {
                 }
                 if (result?.journalUnit) {
                     fresh.xray.accessLogs.journalUnit = result.journalUnit;
+                    if (Array.isArray(result.journalSources) && result.journalSources.length > 0) {
+                        fresh.xray.accessLogs.journalSources = result.journalSources;
+                    }
                     fingerprint = desiredFingerprint(shouldShip, settings, tokenHash, fresh);
                     await HyNode.updateOne({ _id: node._id }, {
-                        $set: { 'xray.accessLogs.journalUnit': result.journalUnit },
+                        $set: {
+                            'xray.accessLogs.journalUnit': result.journalUnit,
+                            ...(Array.isArray(result.journalSources) && result.journalSources.length > 0
+                                ? { 'xray.accessLogs.journalSources': result.journalSources }
+                                : {}),
+                        },
                     });
                 }
             } else if (fresh.type === 'xray' && !(previousXrayTornDown && !shouldShip)) {
@@ -1218,6 +1284,8 @@ module.exports = {
     waitForAccessLogAgentSourceReady,
     resolveIngestUrl,
     isEligibleNode,
+    normalizeHysteriaJournalSources,
+    journalSourceStatusMatches,
     accessLogSourceForNode,
     buildHysteriaTeardownNode,
     buildXrayTeardownNode,

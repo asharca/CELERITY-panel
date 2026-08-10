@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -136,5 +137,49 @@ func TestHysteriaFormatOnFileDoesNotDisableXrayManagement(t *testing.T) {
 	}}
 	if cfg.IsHysteriaOnly() {
 		t.Fatal("only the explicit journal + hysteria2-json contract may select hysteria-only mode")
+	}
+}
+
+func TestLoadConfigSupportsMultipleTaggedJournalSources(t *testing.T) {
+	path := writeConfigForTest(t, `{
+		"access_logs":{
+			"enabled":true,
+			"source":"journal",
+			"format":"hysteria2-json",
+			"journal_sources":[
+				{"unit":"hysteria-server","tag":"main"},
+				{"unit":"hysteria-server@mobile","tag":"mobile"},
+				{"unit":"hysteria-dev","tag":"dev"}
+			]
+		}
+	}`)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.AccessLogs.JournalUnit != "hysteria-server" {
+		t.Fatalf("legacy journal unit = %q", cfg.AccessLogs.JournalUnit)
+	}
+	want := []JournalSource{
+		{Unit: "hysteria-server", Tag: "main"},
+		{Unit: "hysteria-server@mobile", Tag: "mobile"},
+		{Unit: "hysteria-dev", Tag: "dev"},
+	}
+	if got := cfg.AccessLogs.EffectiveJournalSources(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("journal sources = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadConfigRejectsUnsafeOrAmbiguousJournalSources(t *testing.T) {
+	for _, config := range []string{
+		`{"access_logs":{"source":"journal","format":"hysteria2-json","journal_sources":[{"unit":"hysteria-server; reboot","tag":"main"}]}}`,
+		`{"access_logs":{"source":"journal","format":"hysteria2-json","journal_sources":[{"unit":"hysteria-server","tag":""},{"unit":"hysteria-dev","tag":"dev"}]}}`,
+		`{"access_logs":{"source":"journal","format":"hysteria2-json","journal_sources":[{"unit":"hysteria-server","tag":"main"},{"unit":"hysteria-server","tag":"other"}]}}`,
+		`{"access_logs":{"source":"journal","format":"hysteria2-json","journal_sources":[{"unit":"hysteria-server","tag":"not valid"}]}}`,
+	} {
+		if _, err := LoadConfig(writeConfigForTest(t, config)); err == nil {
+			t.Fatalf("expected invalid journal sources to fail: %s", config)
+		}
 	}
 }

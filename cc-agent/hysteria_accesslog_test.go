@@ -160,3 +160,17 @@ func TestParseHysteria2EpochMillisFraction(t *testing.T) {
 		t.Fatalf("got %s want %s", ts, want)
 	}
 }
+
+func TestNormalizeHysteria2TagsMultiRuntime(t *testing.T) {
+	line := `{"time":1786350896789,"msg":"UDP request","addr":"203.0.113.1:123","id":"admin","reqAddr":"example.com:443","sessionID":7}`
+	normalized, result := normalizeHysteria2AccessLineForRuntime(line, "mobile")
+	if result != hysteria2NormalizeAccepted {
+		t.Fatalf("normalization result = %v", result)
+	}
+	if !strings.Contains(normalized, "[hysteria2/mobile/session-7 -> direct]") {
+		t.Fatalf("runtime tag missing from normalized line: %q", normalized)
+	}
+	if _, result := normalizeHysteria2AccessLineForRuntime(line, "not valid"); result != hysteria2NormalizeInvalid {
+		t.Fatalf("unsafe runtime result = %v, want invalid", result)
+	}
+}

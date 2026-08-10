@@ -305,12 +305,25 @@ const xrayConfigSchema = new mongoose.Schema({
             privateKey: { type: String, default: '' },
             password: { type: String, default: '' },
         },
-        // Effective systemd unit used by HY2 journal shipping. Empty means the
-        // current official default and is detected on first reconciliation.
+        // Effective systemd unit used by legacy single-source HY2 journal
+        // shipping. Empty means the current official default and is detected on
+        // first reconciliation. Kept for compatibility with existing nodes.
         journalUnit: {
             type: String,
-            enum: ['', 'hysteria-server', 'hysteria'],
             default: '',
+            trim: true,
+            maxlength: 128,
+        },
+        // One physical host can run several Hysteria services behind separate
+        // public NAT entries. They share one cc-agent/token, but each unit gets
+        // a stable tag in the normalized access record and an independent
+        // journal cursor. An empty list falls back to journalUnit above.
+        journalSources: {
+            type: [{
+                unit: { type: String, required: true, trim: true, maxlength: 128 },
+                tag: { type: String, required: true, trim: true, maxlength: 64 },
+            }],
+            default: [],
         },
         lastError: { type: String, default: '' },
         lastBatchAt: { type: Date, default: null },

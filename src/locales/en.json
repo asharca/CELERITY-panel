@@ -70,7 +70,7 @@
     "title": "Xray / HY2 access logs",
     "enable": "Collect and analyze access logs",
     "enableHint": "Disabled by default. Collection runs through cc-agent; storage and analytics live in an external ClickHouse.",
-    "enableWarning": "Enabling configures and restarts the proxy service on selected nodes (connections may briefly drop), then starts collecting access logs. Xray and HY2 require cc-agent 1.5.1+; HY2 also needs saved SSH credentials for automatic installation or upgrade.",
+    "enableWarning": "Enabling configures and restarts the proxy service on selected nodes (connections may briefly drop), then starts collecting access logs. Xray and HY2 require cc-agent 1.5.2+; HY2 also needs saved SSH credentials for automatic installation or upgrade.",
     "currentState": "Current state",
     "stateDisabled": "Disabled",
     "stateEnabling": "Enabling...",

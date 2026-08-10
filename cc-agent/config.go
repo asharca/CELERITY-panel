@@ -23,6 +23,15 @@ const (
 )
 
 var systemdUnitNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$`)
+var journalSourceTagRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+
+// JournalSource identifies one systemd journal stream. Tag is appended to
+// normalized HY2 inbound tags so multiple services on the same physical host
+// remain distinguishable after they share a single cc-agent and ingest token.
+type JournalSource struct {
+	Unit string `json:"unit"`
+	Tag  string `json:"tag"`
+}
 
 // AccessLogsConfig configures the opt-in access-log tail/ship module.
 // When Enabled is false (or the whole block is absent) the module stays inert
@@ -43,9 +52,15 @@ type AccessLogsConfig struct {
 	// Path to the Xray access log file the agent tails.
 	Path string `json:"path"`
 
-	// JournalUnit is followed when Source is "journal". It is passed as a
-	// journalctl argv item (never through a shell) and also strictly validated.
+	// JournalUnit is the legacy single journal source. It is retained so older
+	// panel versions and existing configs remain compatible. New configs may
+	// supply JournalSources instead.
 	JournalUnit string `json:"journal_unit"`
+
+	// JournalSources follows multiple systemd units through independent cursors.
+	// It is only meaningful for Source="journal". The first source also becomes
+	// JournalUnit for compatibility with older status consumers.
+	JournalSources []JournalSource `json:"journal_sources,omitempty"`
 
 	// IngestURL is the full panel endpoint that receives NDJSON+gzip batches.
 	IngestURL string `json:"ingest_url"`
@@ -84,6 +99,9 @@ func (c *AccessLogsConfig) applyDefaults() {
 	if c.Path == "" {
 		c.Path = "/var/log/xray/access.log"
 	}
+	if c.JournalUnit == "" && len(c.JournalSources) > 0 {
+		c.JournalUnit = c.JournalSources[0].Unit
+	}
 	if c.JournalUnit == "" {
 		c.JournalUnit = "hysteria-server"
 	}
@@ -120,10 +138,51 @@ func (c *AccessLogsConfig) validate() error {
 	if c.Source == accessLogSourceFile && strings.TrimSpace(c.Path) == "" {
 		return fmt.Errorf("access_logs.path is required for file source")
 	}
-	if c.Source == accessLogSourceJournal && !validSystemdUnitName(c.JournalUnit) {
-		return fmt.Errorf("access_logs.journal_unit is invalid")
+	if c.Source == accessLogSourceJournal {
+		seenUnits := make(map[string]struct{})
+		seenTags := make(map[string]struct{})
+		for _, source := range c.EffectiveJournalSources() {
+			if !validSystemdUnitName(source.Unit) {
+				return fmt.Errorf("access_logs journal source unit is invalid")
+			}
+			if source.Tag != "" && !journalSourceTagRE.MatchString(source.Tag) {
+				return fmt.Errorf("access_logs journal source tag is invalid")
+			}
+			if _, exists := seenUnits[source.Unit]; exists {
+				return fmt.Errorf("access_logs journal source unit is duplicated")
+			}
+			seenUnits[source.Unit] = struct{}{}
+			if source.Tag != "" {
+				if _, exists := seenTags[source.Tag]; exists {
+					return fmt.Errorf("access_logs journal source tag is duplicated")
+				}
+				seenTags[source.Tag] = struct{}{}
+			}
+		}
+		if len(c.JournalSources) > 1 {
+			for _, source := range c.JournalSources {
+				if source.Tag == "" {
+					return fmt.Errorf("access_logs journal source tag is required for multiple sources")
+				}
+			}
+		}
 	}
 	return nil
+}
+
+// EffectiveJournalSources returns the configured sources, falling back to the
+// legacy singular journal_unit. Callers can use this without branching on the
+// version of the panel that produced the config.
+func (c AccessLogsConfig) EffectiveJournalSources() []JournalSource {
+	if c.Source != accessLogSourceJournal {
+		return nil
+	}
+	if len(c.JournalSources) == 0 {
+		return []JournalSource{{Unit: c.JournalUnit}}
+	}
+	sources := make([]JournalSource, len(c.JournalSources))
+	copy(sources, c.JournalSources)
+	return sources
 }
 
 func validSystemdUnitName(unit string) bool {

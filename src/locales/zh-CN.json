@@ -70,7 +70,7 @@
     "title": "Xray / HY2 访问日志",
     "enable": "收集并分析访问日志",
     "enableHint": "默认关闭。通过 cc-agent 收集，存储与分析在外部 ClickHouse 中进行。",
-    "enableWarning": "启用会配置并重启所选节点的代理服务（可能短暂断连），然后开始收集访问日志。Xray 与 HY2 均需要 cc-agent 1.5.1+；HY2 还需保存 SSH 凭据以便自动安装或升级。",
+    "enableWarning": "启用会配置并重启所选节点的代理服务（可能短暂断连），然后开始收集访问日志。Xray 与 HY2 均需要 cc-agent 1.5.2+；HY2 还需保存 SSH 凭据以便自动安装或升级。",
     "currentState": "当前状态",
     "stateDisabled": "已禁用",
     "stateEnabling": "启用中…",

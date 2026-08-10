@@ -44,21 +44,35 @@ assert.strictEqual(provision.isEligibleNode({ ...hy, cascadeRole: 'bridge' }), f
 assert.strictEqual(provision.isEligibleNode({ ...hy, type: 'virtual' }), false);
 assert.strictEqual(provision.isEligibleNode({ ...hy, active: false }), false);
 
-assert.strictEqual(provision.minimumAgentVersionForNode(hy), '1.5.1');
-assert.strictEqual(provision.minimumAgentVersionForNode(xray), '1.5.1');
-assert.strictEqual(provision.agentVersionAtLeast('v1.5.1', '1.5.1'), true);
-assert.strictEqual(provision.agentVersionAtLeast('1.5.0', '1.5.1'), false);
+assert.strictEqual(provision.minimumAgentVersionForNode(hy), '1.5.2');
+assert.strictEqual(provision.minimumAgentVersionForNode(xray), '1.5.2');
+assert.strictEqual(provision.agentVersionAtLeast('v1.5.2', '1.5.2'), true);
+assert.strictEqual(provision.agentVersionAtLeast('1.5.1', '1.5.2'), false);
 assert.strictEqual(provision.agentVersionAtLeast('installed', '1.5.1'), false);
 assert.strictEqual(nodeSetup.parseAgentVersion('cc-agent 1.5.0'), '1.5.0');
 assert.strictEqual(nodeSetup.parseAgentVersion('2026/08/10 cc-agent v1.5.1'), '1.5.1');
 assert.strictEqual(nodeSetup.parseAgentVersion('download complete'), '');
-assert.strictEqual(nodeSetup.isAgentVersionAtLeast('1.5.1', '1.5.1'), true);
-assert.strictEqual(nodeSetup.isAgentVersionAtLeast('1.5.0', '1.5.1'), false);
+assert.strictEqual(nodeSetup.isAgentVersionAtLeast('1.5.2', '1.5.2'), true);
+assert.strictEqual(nodeSetup.isAgentVersionAtLeast('1.5.1', '1.5.2'), false);
 assert.strictEqual(nodeSetup.normalizeFirewallSource('203.0.113.10/32'), '203.0.113.10/32');
 assert.strictEqual(nodeSetup.normalizeFirewallSource('[2001:db8::1]/64'), '2001:db8::1/64');
 assert.strictEqual(nodeSetup.normalizeFirewallSource('https://panel.example.invalid:8443/path'), 'panel.example.invalid');
 assert.strictEqual(nodeSetup.normalizeFirewallSource('203.0.113.10; touch /tmp/pwned'), '');
 assert.strictEqual(nodeSetup.normalizeFirewallSource('panel.example.invalid$(id)'), '');
+
+// A panel operator may deliberately SSH as an unprivileged service account
+// with passwordless sudo. Agent provisioning must stage uploads in /tmp and
+// elevate only the fixed system mutations, rather than requiring a root SSH
+// login or attempting to write /usr/local directly.
+const privilegedDaemonReload = nodeSetup.buildPrivilegedShellCommand('systemctl daemon-reload');
+assert(privilegedDaemonReload.includes('id -u'), 'root logins must stay supported without sudo');
+assert(privilegedDaemonReload.includes('sudo -n sh -c'), 'non-root SSH uses non-interactive sudo');
+assert(privilegedDaemonReload.includes("'systemctl daemon-reload'"));
+const agentInstallerSource = nodeSetup.installCCAgent.toString();
+assert(agentInstallerSource.includes('`/tmp/.cc-agent-download-'));
+assert(!agentInstallerSource.includes('/usr/local/bin/.cc-agent-download-'));
+assert(agentInstallerSource.includes('execPrivilegedSSH'));
+assert(agentInstallerSource.includes('uploadPrivilegedFile'));
 
 assert.strictEqual(
     provision.nodeShouldShip(hy, { accessLogs: { enabled: true, nodeScope: 'all' } }),
@@ -75,6 +89,7 @@ assert.deepStrictEqual(provision.accessLogSourceForNode(hy), {
     source: 'journal',
     format: 'hysteria2-json',
     journalUnit: 'hysteria-server',
+    journalSources: [{ unit: 'hysteria-server', tag: '' }],
     path: '',
 });
 assert.strictEqual(
@@ -87,6 +102,44 @@ assert.deepStrictEqual(provision.accessLogSourceForNode(xray), {
     journalUnit: 'xray',
     path: '',
 });
+
+const multiJournalSources = [
+    { unit: 'hysteria-server', tag: 'main' },
+    { unit: 'hysteria-server@mobile', tag: 'mobile' },
+    { unit: 'hysteria-server@telecom', tag: 'telecom' },
+    { unit: 'hysteria-dev', tag: 'dev' },
+];
+assert.deepStrictEqual(
+    provision.normalizeHysteriaJournalSources({ journalSources: multiJournalSources }),
+    multiJournalSources,
+    'a physical HY2 host can publish several tagged systemd sources'
+);
+assert.throws(
+    () => provision.normalizeHysteriaJournalSources({
+        journalSources: [{ unit: 'hysteria-server' }, { unit: 'hysteria-dev', tag: 'dev' }],
+    }),
+    /needs a runtime tag/
+);
+assert.throws(
+    () => provision.normalizeHysteriaJournalSources({
+        journalSources: [{ unit: 'hysteria-server; reboot', tag: 'main' }],
+    }),
+    /Invalid Hysteria journal systemd unit/
+);
+const multiHy = { ...hy, xray: { accessLogs: { journalSources: multiJournalSources } } };
+assert.deepStrictEqual(provision.accessLogSourceForNode(multiHy), {
+    source: 'journal',
+    format: 'hysteria2-json',
+    journalUnit: 'hysteria-server',
+    journalSources: multiJournalSources,
+    path: '',
+});
+assert.strictEqual(provision.journalSourceStatusMatches({
+    journal_sources: multiJournalSources,
+}, provision.accessLogSourceForNode(multiHy)), true);
+assert.strictEqual(provision.journalSourceStatusMatches({
+    journal_sources: multiJournalSources.slice(0, 3),
+}, provision.accessLogSourceForNode(multiHy)), false);
 assert.strictEqual(
     configGenerator.buildXrayLogSection({ xray: { accessLogs: { enabled: true } } }).access,
     '',
@@ -109,6 +162,17 @@ assert.strictEqual(
     nodeSetup.hysteriaAccessLogOverridePath('hysteria'),
     '/etc/systemd/system/hysteria.service.d/20-celerity-access-logs.conf'
 );
+assert.strictEqual(
+    nodeSetup.hysteriaAccessLogOverridePath('hysteria-server@mobile'),
+    '/etc/systemd/system/hysteria-server@mobile.service.d/20-celerity-access-logs.conf'
+);
+assert.deepStrictEqual(
+    nodeSetup.normalizeHysteriaJournalSources({ journalSources: multiJournalSources }),
+    multiJournalSources
+);
+assert.strictEqual(nodeSetup.journalSourcesMatchAgentStatus({
+    journal_sources: multiJournalSources.map(source => ({ ...source, source_ready: true })),
+}, { source: 'journal', journalSources: multiJournalSources }), true);
 assert.throws(() => nodeSetup.hysteriaAccessLogOverridePath('hysteria; reboot'), /Unsupported/);
 assert.doesNotThrow(() => nodeSetup.assertHysteriaExecStartLoggingCompatible(
     '{ argv[]=/usr/local/bin/hysteria server --config /etc/hysteria/config.yaml ; }'
@@ -188,14 +252,14 @@ const nodeSetupSource = fs.readFileSync(path.join(__dirname, '..', 'src/services
 const reconcileStart = nodeSetupSource.indexOf('async function reconcileHysteriaAccessLogsUnlocked');
 const reconcileEnd = nodeSetupSource.indexOf('\nfunction reconcileHysteriaAccessLogs(', reconcileStart);
 const reconcileSource = nodeSetupSource.slice(reconcileStart, reconcileEnd);
-assert(reconcileSource.includes('detectHysteriaSystemdUnit'));
-assert(reconcileSource.includes('systemctl restart ${journalUnit}'));
+assert(reconcileSource.includes('normalizeHysteriaJournalSources(accessLogs)'));
+assert(reconcileSource.includes('systemctl restart ${source.unit}'));
 assert(reconcileSource.includes('systemctl restart cc-agent'));
 assert(
-    reconcileSource.indexOf('systemctl restart cc-agent') < reconcileSource.indexOf('systemctl restart ${journalUnit}'),
+    reconcileSource.indexOf('systemctl restart cc-agent') < reconcileSource.indexOf('systemctl restart ${source.unit}'),
     'agent must follow the journal before Hysteria starts emitting request events'
 );
-assert(reconcileSource.includes("execSSH(conn, 'systemctl daemon-reload')"));
+assert(reconcileSource.includes("execPrivilegedSSH(conn, 'systemctl daemon-reload')"));
 assert(reconcileSource.includes('assertHysteriaEffectiveLoggingEnvironment(effectiveEnvironment.output)'));
 assert(reconcileSource.includes('/proc/$PID/environ'), 'running HY2 process environment is verified after restart');
 assert(reconcileSource.includes('/proc/$PID/exe'), 'the systemd MainPID must directly execute Hysteria');
@@ -225,6 +289,20 @@ assert.strictEqual(agentConfig.access_logs.format, 'hysteria2-json');
 assert.strictEqual(agentConfig.access_logs.journal_unit, 'hysteria-server');
 assert.strictEqual(agentConfig.access_logs.path, '');
 assert.strictEqual(agentConfig.access_logs.ingest_token, 'ingest-token');
+const multiAgentConfig = nodeSetup.buildAgentConfig(
+    { type: 'hysteria', xray: {} },
+    'agent-token',
+    62080,
+    61000,
+    true,
+    {
+        ...provision.accessLogSourceForNode(multiHy),
+        enabled: true,
+        ingestUrl: 'https://panel.example.invalid/api/access-logs/ingest',
+        ingestToken: 'ingest-token',
+    }
+);
+assert.deepStrictEqual(multiAgentConfig.access_logs.journal_sources, multiJournalSources);
 
 const modelNode = new HyNode({ type: 'hysteria', name: 'hy', ip: '203.0.113.10' });
 modelNode.xray.accessLogs.status = 'agent-missing';
@@ -233,6 +311,7 @@ modelNode.xray.accessLogs.appliedIp = '203.0.113.10';
 modelNode.xray.accessLogs.appliedSsh.password = 'encrypted-old-password';
 modelNode.xray.accessLogs.pendingSsh.privateKey = 'encrypted-pending-key';
 modelNode.xray.accessLogs.journalUnit = 'hysteria';
+modelNode.xray.accessLogs.journalSources = multiJournalSources;
 assert.strictEqual(modelNode.validateSync(), undefined, 'HY2 can persist agent-missing state');
 assert.strictEqual(modelNode.xray.accessLogs.appliedSsh.password, 'encrypted-old-password');
 assert.strictEqual(modelNode.xray.accessLogs.pendingSsh.privateKey, 'encrypted-pending-key');
@@ -368,7 +447,7 @@ assert(
         readinessSyncService._agentRequest = async () => ({
             status: 200,
             data: {
-                agent_version: '1.5.1',
+                agent_version: '1.5.2',
                 access_logs: {
                     enabled: true,
                     source: 'journal',
@@ -535,7 +614,7 @@ assert(
         ...legacyHy,
         _id: 'stale-hy',
         name: 'Stale HY2 metadata',
-        agentVersion: '1.5.1',
+        agentVersion: '1.5.2',
         xray: {
             agentToken: 'agent-token',
             accessLogs: { ...legacyHy.xray.accessLogs },
@@ -598,7 +677,7 @@ assert(
             remoteEnabledActions.push(accessLogs.enabled);
             assert.strictEqual(accessLogs.source, 'journal');
             assert.strictEqual(accessLogs.format, 'hysteria2-json');
-            return { success: true, agentVersion: '1.5.1' };
+            return { success: true, agentVersion: '1.5.2' };
         };
 
         const result = await provision.reconcileNode(legacyHy, settings);
@@ -667,7 +746,7 @@ assert(
             type: 'xray',
             active: false,
             cascadeRole: 'standalone',
-            agentVersion: '1.5.1',
+            agentVersion: '1.5.2',
             xray: {
                 accessLogs: {
                     enabled: true,
@@ -741,7 +820,7 @@ assert(
             type: 'xray',
             active: true,
             cascadeRole: 'standalone',
-            agentVersion: '1.5.1',
+            agentVersion: '1.5.2',
             ip: '203.0.113.77',
             ssh: { username: 'root', password: 'test-only' },
             xray: {
@@ -771,7 +850,7 @@ assert(
         syncService._agentRequest = async () => ({
             status: 200,
             data: {
-                agent_version: '1.5.1',
+                agent_version: '1.5.2',
                 access_logs: {
                     enabled: false,
                     source: 'journal',

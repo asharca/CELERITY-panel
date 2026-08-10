@@ -507,6 +507,23 @@ function execSSH(conn, command, options = {}) {
     });
 }
 
+// Nodes are often administered through a dedicated, unprivileged SSH account
+// which has passwordless sudo. Keep root logins working without requiring the
+// sudo binary, while making every privileged operation fail promptly instead
+// of hanging for an interactive password prompt.
+function buildPrivilegedShellCommand(command) {
+    const script = shellSingleQuote(String(command || ''));
+    return `if [ "$(id -u)" -eq 0 ]; then
+    exec sh -c ${script}
+else
+    exec sudo -n sh -c ${script}
+fi`;
+}
+
+function execPrivilegedSSH(conn, command, options = {}) {
+    return execSSH(conn, buildPrivilegedShellCommand(command), options);
+}
+
 function resolveNodeServiceCandidates(node) {
     if (!node || node.type === 'virtual') return [];
     if (node.type === 'xray') return ['xray'];
@@ -629,6 +646,53 @@ function uploadFile(conn, content, remotePath, options = {}) {
     });
 }
 
+// SFTP runs as the SSH account and therefore cannot write root-owned systemd
+// and /etc paths for a passwordless-sudo operator. Upload to a private /tmp
+// staging file first, then use a fixed `install` command under sudo. The
+// remote destination is shell-quoted even though all current callers use
+// fixed paths, so this helper stays safe if it is reused.
+async function uploadPrivilegedFile(conn, content, remotePath, options = {}) {
+    const mode = String(options.mode || '600');
+    if (!/^[0-7]{3,4}$/.test(mode)) {
+        throw new Error(`Invalid remote file mode: ${mode}`);
+    }
+    const destination = String(remotePath || '');
+    if (!destination.startsWith('/')) {
+        throw new Error('Privileged upload destination must be an absolute path');
+    }
+
+    const stagingDirectory = `/tmp/.celerity-upload-${require('crypto').randomBytes(16).toString('hex')}`;
+    const stagingPath = `${stagingDirectory}/payload`;
+    const createStagingDirectory = await execSSH(
+        conn,
+        `umask 077 && mkdir -m 700 ${shellSingleQuote(stagingDirectory)}`,
+        options
+    );
+    if (!createStagingDirectory.success) {
+        throw new Error(`Cannot create private upload staging directory: ${createStagingDirectory.output || createStagingDirectory.error || 'unknown error'}`);
+    }
+    try {
+        await uploadFile(conn, content, stagingPath, options);
+        const installResult = await execPrivilegedSSH(
+            conn,
+            `install -D -m ${mode} ${shellSingleQuote(stagingPath)} ${shellSingleQuote(destination)}\nrm -f ${shellSingleQuote(stagingPath)}`,
+            options
+        );
+        if (!installResult.success) {
+            throw new Error(`Cannot install ${destination}: ${installResult.output || installResult.error || 'unknown error'}`);
+        }
+    } finally {
+        // The SSH account owns the staging file. Best-effort cleanup also
+        // covers a failed sudo check without revealing the uploaded content.
+        try {
+            await execSSH(conn, `rm -f ${shellSingleQuote(stagingPath)} && rmdir ${shellSingleQuote(stagingDirectory)} 2>/dev/null || true`, options);
+        } catch (_) {
+            // A stale /tmp staging file is harmless and will be cleaned by the
+            // operating system. Preserve the primary provisioning error.
+        }
+    }
+}
+
 // Read a small remote file without sending its contents through a shell or
 // command output. This is used for ownership checks on credential-bearing
 // config files, so their tokens never appear in logs.
@@ -699,8 +763,35 @@ function assertCcAgentConfigContentOwnership(content, expectedToken) {
 }
 
 async function assertCcAgentConfigOwnership(conn, expectedToken) {
-    const content = await readRemoteFileIfExists(conn, '/etc/cc-agent/config.json');
-    assertCcAgentConfigContentOwnership(content, expectedToken);
+    try {
+        const content = await readRemoteFileIfExists(conn, '/etc/cc-agent/config.json');
+        assertCcAgentConfigContentOwnership(content, expectedToken);
+        return;
+    } catch (error) {
+        // A root-owned 0600 config is intentionally unreadable through SFTP
+        // for a non-root SSH account. Verify ownership through sudo without
+        // returning either token in command output.
+        const permissionDenied = error?.code === 3 || /permission denied/i.test(error?.message || '');
+        if (!permissionDenied) throw error;
+    }
+
+    const expectedHash = require('crypto')
+        .createHash('sha256')
+        .update(String(expectedToken || ''), 'utf8')
+        .digest('hex');
+    const result = await execPrivilegedSSH(conn, `
+CONFIG='/etc/cc-agent/config.json'
+[ -e "$CONFIG" ] || exit 0
+CURRENT_TOKEN="$(sed -n 's/^[[:space:]]*"token"[[:space:]]*:[[:space:]]*"\\([^\"]*\\)".*$/\\1/p' "$CONFIG" | head -n 1)"
+[ -n "$CURRENT_TOKEN" ] || exit 42
+CURRENT_HASH="$(printf '%s' "$CURRENT_TOKEN" | sha256sum | awk '{print $1}')" || exit 43
+[ "$CURRENT_HASH" = ${shellSingleQuote(expectedHash)} ] || exit 42
+`);
+    if (result.success) return;
+    if (result.code === 42) {
+        throw new Error('Existing cc-agent config belongs to another node or proxy service; shared-host collection requires a separate agent instance');
+    }
+    throw new Error(`Cannot inspect existing cc-agent config: ${result.output || result.error || 'unknown error'}`);
 }
 
 async function assertNodeSshCcAgentConfigOwnership(ssh, expectedToken) {
@@ -1618,8 +1709,11 @@ fi`;
         firewallRules += '\n' + IPTABLES_SAVE_SNIPPET;
     }
 
-    // Step 1: Download binary
+    // Step 1: Download binary as the SSH user. A non-root operator can write
+    // /tmp but not /usr/local/bin; installation into the system path is the
+    // small, explicit privileged step immediately afterwards.
     log('Downloading cc-agent binary...');
+    const binaryStagingPath = `/tmp/.cc-agent-download-${require('crypto').randomBytes(16).toString('hex')}`;
     const downloadResult = await execSSH(conn, `
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
@@ -1628,45 +1722,45 @@ else
     BIN="cc-agent-linux-amd64"
 fi
 URL="https://github.com/ClickDevTech/CELERITY-panel/releases/latest/download/$BIN"
-TMP="/usr/local/bin/.cc-agent-download-$$"
-trap 'rm -f "$TMP"' EXIT
+TMP=${shellSingleQuote(binaryStagingPath)}
 echo "Downloading $URL ..."
 curl -fsSL --max-time 120 "$URL" -o "$TMP"
 if [ ! -s "$TMP" ]; then
     echo "ERROR: Download failed or file is empty"
     exit 1
 fi
-chmod +x "$TMP"
-"$TMP" -version 2>&1 || { echo "ERROR: Downloaded cc-agent cannot execute"; exit 1; }
-mv -f "$TMP" /usr/local/bin/cc-agent || exit 1
-trap - EXIT
-echo "OK: cc-agent binary ready"
-ls -la /usr/local/bin/cc-agent
 `);
 
     if (!downloadResult.success) {
         log(`Binary download failed: ${downloadResult.output}`);
         return { success: false, agentVersion: '', output: downloadResult.output };
     }
+    const binaryInstallResult = await execPrivilegedSSH(
+        conn,
+        `install -m 755 ${shellSingleQuote(binaryStagingPath)} /usr/local/bin/cc-agent\nrm -f ${shellSingleQuote(binaryStagingPath)}\necho "OK: cc-agent binary ready"\n/usr/local/bin/cc-agent -version 2>&1 || true`
+    );
+    if (!binaryInstallResult.success) {
+        // The SSH account owns this staging file, so cleanup remains possible
+        // even when sudo is not configured correctly.
+        await execSSH(conn, `rm -f ${shellSingleQuote(binaryStagingPath)}`).catch(() => {});
+        log(`Binary installation failed: ${binaryInstallResult.output}`);
+        return { success: false, agentVersion: '', output: binaryInstallResult.output || binaryInstallResult.error };
+    }
     log('Binary downloaded');
 
     // Step 2: Write config
     log('Writing agent config...');
-    const configDirsResult = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+    const configDirsResult = await execPrivilegedSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
     if (!configDirsResult.success) {
         return { success: false, agentVersion: '', output: configDirsResult.output || configDirsResult.error };
     }
-    await uploadFile(conn, configJson, '/etc/cc-agent/config.json');
-    const configModeResult = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
-    if (!configModeResult.success) {
-        return { success: false, agentVersion: '', output: configModeResult.output || configModeResult.error };
-    }
+    await uploadPrivilegedFile(conn, configJson, '/etc/cc-agent/config.json', { mode: '600' });
     log('Config written');
 
     // Step 3: Generate TLS cert if needed
     if (useTls) {
         log('Generating TLS certificate...');
-        const tlsResult = await execSSH(conn, `
+        const tlsResult = await execPrivilegedSSH(conn, `
 openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout /etc/cc-agent/key.pem \
     -out /etc/cc-agent/cert.pem \
@@ -1682,8 +1776,9 @@ echo "OK: TLS cert generated"
 
     // Step 4: Install systemd service
     log('Installing systemd service...');
-    const hysteriaUnit = ['hysteria-server', 'hysteria'].includes(accessLogs?.journalUnit)
-        ? accessLogs.journalUnit : 'hysteria-server';
+    const hysteriaUnit = node.type === 'hysteria'
+        ? normalizeHysteriaJournalSources(accessLogs)[0].unit
+        : 'hysteria-server';
     const proxyService = node.type === 'hysteria' ? `${hysteriaUnit}.service` : 'xray.service';
     const serviceUnit = `[Unit]
 Description=CC Proxy Agent
@@ -1700,12 +1795,12 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 `;
-    await uploadFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service');
+    await uploadPrivilegedFile(conn, serviceUnit, '/etc/systemd/system/cc-agent.service', { mode: '644' });
     log('Service unit installed');
 
     // Step 5: Firewall + start service
     log('Configuring firewall and starting service...');
-    const startResult = await execSSH(conn, `
+    const startResult = await execPrivilegedSSH(conn, `
 ${firewallRules}
 systemctl daemon-reload
 systemctl enable cc-agent
@@ -1720,7 +1815,7 @@ else
 fi
 `);
 
-    const allOutput = [downloadResult.output, startResult.output].join('\n');
+    const allOutput = [downloadResult.output, binaryInstallResult.output, startResult.output].join('\n');
     const agentVersion = parseAgentVersion(allOutput) || 'installed';
     const isRunning = startResult.output.includes('OK: cc-agent running');
 
@@ -1869,11 +1964,19 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
         cfg.access_logs = {
             enabled: !!accessLogs.enabled,
             // Source/format are understood by journal-capable agents. The
-            // access-log provisioner gates both Xray and HY2 on cc-agent 1.5.1+
+            // access-log provisioner gates both Xray and HY2 on cc-agent 1.5.2+
             // before it can enable this block.
             source: accessLogs.source || 'file',
             format: accessLogs.format || 'xray',
             journal_unit: accessLogs.journalUnit || '',
+            ...(Array.isArray(accessLogs.journalSources) && accessLogs.journalSources.length > 0
+                ? {
+                    journal_sources: accessLogs.journalSources.map(source => ({
+                        unit: String(source?.unit || ''),
+                        tag: String(source?.tag || ''),
+                    })),
+                }
+                : {}),
             path: accessLogs.path !== undefined ? accessLogs.path : '/var/log/xray/access.log',
             ingest_url: accessLogs.ingestUrl || '',
             ingest_token: accessLogs.ingestToken || '',
@@ -1947,20 +2050,67 @@ function reloadCcAgent(node, ssh) {
 const HYSTERIA_ACCESS_LOG_OVERRIDE_PATH =
     '/etc/systemd/system/hysteria-server.service.d/20-celerity-access-logs.conf';
 const HYSTERIA_ACCESS_LOG_OVERRIDE_FILE = '20-celerity-access-logs.conf';
+const HYSTERIA_SYSTEMD_UNIT_RE = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$/;
+const HYSTERIA_RUNTIME_TAG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+function validHysteriaSystemdUnit(unit) {
+    return HYSTERIA_SYSTEMD_UNIT_RE.test(String(unit || ''))
+        && !String(unit).includes('..')
+        && !String(unit).endsWith('.service');
+}
+
+function normalizeHysteriaJournalSources(accessLogs = {}) {
+    const configured = Array.isArray(accessLogs?.journalSources)
+        ? accessLogs.journalSources : [];
+    const sources = configured.length > 0
+        ? configured.map(source => ({
+            unit: String(source?.unit || '').trim(),
+            tag: String(source?.tag || '').trim(),
+        }))
+        : [{ unit: String(accessLogs?.journalUnit || 'hysteria-server').trim(), tag: '' }];
+    const seenUnits = new Set();
+    const seenTags = new Set();
+    for (const source of sources) {
+        if (!validHysteriaSystemdUnit(source.unit)) {
+            throw new Error(`Unsupported Hysteria systemd unit: ${source.unit || '(empty)'}`);
+        }
+        if (sources.length > 1 && !source.tag) {
+            throw new Error(`Hysteria systemd unit ${source.unit} needs a runtime tag`);
+        }
+        if (source.tag && !HYSTERIA_RUNTIME_TAG_RE.test(source.tag)) {
+            throw new Error(`Invalid Hysteria runtime tag: ${source.tag}`);
+        }
+        if (seenUnits.has(source.unit)) {
+            throw new Error(`Duplicate Hysteria systemd unit: ${source.unit}`);
+        }
+        if (source.tag && seenTags.has(source.tag)) {
+            throw new Error(`Duplicate Hysteria runtime tag: ${source.tag}`);
+        }
+        seenUnits.add(source.unit);
+        if (source.tag) seenTags.add(source.tag);
+    }
+    return sources;
+}
 
 function hysteriaAccessLogOverridePath(unit) {
-    if (!['hysteria-server', 'hysteria'].includes(unit)) {
+    if (!validHysteriaSystemdUnit(unit)) {
         throw new Error(`Unsupported Hysteria systemd unit: ${unit}`);
     }
     return `/etc/systemd/system/${unit}.service.d/${HYSTERIA_ACCESS_LOG_OVERRIDE_FILE}`;
 }
 
-async function inspectHysteriaSystemdUnits(conn) {
+async function inspectHysteriaSystemdUnits(conn, requestedUnits = ['hysteria-server', 'hysteria']) {
+    const units = [...new Set(requestedUnits.map(unit => String(unit || '').trim()))];
+    for (const unit of units) {
+        if (!validHysteriaSystemdUnit(unit)) {
+            throw new Error(`Unsupported Hysteria systemd unit: ${unit}`);
+        }
+    }
     const states = [];
-    for (const unit of ['hysteria-server', 'hysteria']) {
+    for (const unit of units) {
         const [existsResult, activeResult] = await Promise.all([
-            execSSH(conn, `systemctl cat ${unit}.service >/dev/null 2>&1`),
-            execSSH(conn, `systemctl is-active ${unit}.service >/dev/null 2>&1`),
+            execPrivilegedSSH(conn, `systemctl cat ${unit}.service >/dev/null 2>&1`),
+            execPrivilegedSSH(conn, `systemctl is-active ${unit}.service >/dev/null 2>&1`),
         ]);
         states.push({ unit, exists: !!existsResult.success, active: !!activeResult.success });
     }
@@ -2095,7 +2245,7 @@ async function waitForAgentAccessLogSourceReady(conn, options = {}) {
                 const matches = status.enabled === true
                     && status.source === expected.source
                     && status.format === expected.format
-                    && status.journal_unit === expected.journalUnit;
+                    && journalSourcesMatchAgentStatus(status, expected);
                 if (matches && status.source_ready === true && !status.source_error) {
                     return status;
                 }
@@ -2114,6 +2264,21 @@ async function waitForAgentAccessLogSourceReady(conn, options = {}) {
     throw new Error(`cc-agent access-log source not ready: ${lastError}`);
 }
 
+function journalSourcesMatchAgentStatus(status, expected) {
+    if (expected.source !== 'journal') return true;
+    const expectedSources = Array.isArray(expected?.journalSources) && expected.journalSources.length > 0
+        ? expected.journalSources : [{ unit: expected?.journalUnit || '', tag: '' }];
+    const reported = Array.isArray(status?.journal_sources) && status.journal_sources.length > 0
+        ? status.journal_sources.map(source => ({
+            unit: String(source?.unit || ''),
+            tag: String(source?.tag || ''),
+        }))
+        : [{ unit: String(status?.journal_unit || ''), tag: '' }];
+    return expectedSources.length === reported.length
+        && expectedSources.every((source, index) => source.unit === reported[index].unit
+            && source.tag === reported[index].tag);
+}
+
 function hasStructuredHysteriaStartupLog(output) {
     return String(output || '').split('\n').some(line => {
         try {
@@ -2130,7 +2295,7 @@ function hasStructuredHysteriaStartupLog(output) {
 async function removeHysteriaAccessLogOverride(conn, unit) {
     const overridePath = hysteriaAccessLogOverridePath(unit);
     const overrideDir = `/etc/systemd/system/${unit}.service.d`;
-    const result = await execSSH(conn, `if [ -e ${overridePath} ] || [ -L ${overridePath} ]; then
+    const result = await execPrivilegedSSH(conn, `if [ -e ${overridePath} ] || [ -L ${overridePath} ]; then
     rm -f ${overridePath} || exit 1
 fi
 rmdir ${overrideDir} 2>/dev/null || true`);
@@ -2147,29 +2312,33 @@ async function disableHysteriaAccessLogsRuntime(
     manageAgent,
     log
 ) {
-    const states = await inspectHysteriaSystemdUnits(conn);
-    const preferred = ['hysteria-server', 'hysteria'].includes(accessLogs?.journalUnit)
-        ? accessLogs.journalUnit : '';
-    const selected = states.find(state => state.unit === preferred && state.exists)
-        || states.find(state => state.active)
-        || states.find(state => state.exists);
-    const journalUnit = selected?.unit || preferred || 'hysteria-server';
+    const journalSources = normalizeHysteriaJournalSources(accessLogs);
+    const configuredUnits = journalSources.map(source => source.unit);
+    // Legacy single-source nodes used to clean both official service names.
+    // Keep that behavior while only touching explicitly listed runtimes for a
+    // new multi-source node.
+    const cleanupUnits = Array.isArray(accessLogs?.journalSources)
+        && accessLogs.journalSources.length > 0
+        ? configuredUnits
+        : [...new Set([...configuredUnits, 'hysteria-server', 'hysteria'])];
+    const states = await inspectHysteriaSystemdUnits(conn, cleanupUnits);
+    const journalUnit = journalSources[0].unit;
     const errors = [];
 
     // Privacy first: stop future debug request events even when the agent is
     // missing/broken. Every cleanup action is attempted independently.
-    for (const unit of ['hysteria-server', 'hysteria']) {
+    for (const unit of cleanupUnits) {
         try {
             await removeHysteriaAccessLogOverride(conn, unit);
         } catch (error) {
             errors.push(error.message);
         }
     }
-    const reload = await execSSH(conn, 'systemctl daemon-reload');
+    const reload = await execPrivilegedSSH(conn, 'systemctl daemon-reload');
     if (!reload.success) errors.push(`systemd daemon-reload failed: ${reload.output || reload.error}`);
 
     for (const state of states.filter(item => item.active)) {
-        const restart = await execSSH(conn, `systemctl restart ${state.unit} && systemctl is-active ${state.unit} >/dev/null 2>&1`);
+        const restart = await execPrivilegedSSH(conn, `systemctl restart ${state.unit} && systemctl is-active ${state.unit} >/dev/null 2>&1`);
         if (!restart.success) {
             errors.push(`cannot restart ${state.unit}: ${restart.output || restart.error}`);
         }
@@ -2191,16 +2360,15 @@ async function disableHysteriaAccessLogsRuntime(
                     ...accessLogs,
                     enabled: false,
                     journalUnit,
+                    journalSources,
                     ingestUrl: '',
                     ingestToken: '',
                 }
             );
-            const mkdir = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+            const mkdir = await execPrivilegedSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
             if (!mkdir.success) throw new Error(mkdir.output || mkdir.error || 'cannot prepare cc-agent directories');
-            await uploadFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json');
-            const mode = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
-            if (!mode.success) throw new Error(mode.output || mode.error || 'cannot protect cc-agent config');
-            const restart = await execSSH(
+            await uploadPrivilegedFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json', { mode: '600' });
+            const restart = await execPrivilegedSSH(
                 conn,
                 'systemctl restart cc-agent && systemctl is-active cc-agent >/dev/null 2>&1'
             );
@@ -2214,7 +2382,12 @@ async function disableHysteriaAccessLogsRuntime(
         throw new Error(`Hysteria access-log disable incomplete: ${errors.join('; ')}`);
     }
     log('disabled Hysteria JSON journal shipping');
-    return { success: true, agentVersion: preparedNode.agentVersion || '', journalUnit };
+    return {
+        success: true,
+        agentVersion: preparedNode.agentVersion || '',
+        journalUnit,
+        journalSources,
+    };
 }
 
 /**
@@ -2244,6 +2417,7 @@ async function reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options = {
     let conn;
     let agentVersion = preparedNode.agentVersion || '';
     let journalUnit = '';
+    let journalSources = [];
     let effectiveAccessLogs = null;
     let manageAgent = true;
     let runtimeMutated = false;
@@ -2269,18 +2443,29 @@ async function reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options = {
                 log
             );
         }
-        journalUnit = await detectHysteriaSystemdUnit(conn, accessLogs?.journalUnit);
-        effectiveAccessLogs = { ...accessLogs, journalUnit };
+        journalSources = normalizeHysteriaJournalSources(accessLogs);
+        const sourceStates = await inspectHysteriaSystemdUnits(
+            conn,
+            journalSources.map(source => source.unit)
+        );
+        const missingSource = sourceStates.find(state => !state.exists);
+        if (missingSource) {
+            throw new Error(`Hysteria service ${missingSource.unit}.service does not exist`);
+        }
+        journalUnit = journalSources[0].unit;
+        effectiveAccessLogs = { ...accessLogs, journalUnit, journalSources };
 
         if (enabled) {
-            const execStartResult = await execSSH(
-                conn,
-                `systemctl show ${journalUnit}.service --property=ExecStart --value`
-            );
-            if (!execStartResult.success) {
-                throw new Error(`cannot inspect Hysteria ExecStart: ${execStartResult.output || execStartResult.error}`);
+            for (const source of journalSources) {
+                const execStartResult = await execPrivilegedSSH(
+                    conn,
+                    `systemctl show ${source.unit}.service --property=ExecStart --value`
+                );
+                if (!execStartResult.success) {
+                    throw new Error(`cannot inspect ${source.unit} ExecStart: ${execStartResult.output || execStartResult.error}`);
+                }
+                assertHysteriaExecStartLoggingCompatible(execStartResult.output);
             }
-            assertHysteriaExecStartLoggingCompatible(execStartResult.output);
         }
 
         if (manageAgent && options.installAgent) {
@@ -2314,50 +2499,48 @@ async function reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options = {
                 useTls,
                 effectiveAccessLogs
             );
-            const mkdirResult = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+            const mkdirResult = await execPrivilegedSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
             if (!mkdirResult.success) {
                 throw new Error(`cannot prepare cc-agent directories: ${mkdirResult.output || mkdirResult.error}`);
             }
-            await uploadFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json');
-            const chmodResult = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
-            if (!chmodResult.success) {
-                throw new Error(`cannot protect cc-agent config: ${chmodResult.output || chmodResult.error}`);
-            }
+            await uploadPrivilegedFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json', { mode: '600' });
         }
 
         const override = configGenerator.generateHysteriaAccessLogSystemdOverride(enabled);
-        const overridePath = hysteriaAccessLogOverridePath(journalUnit);
-        const overrideDir = `/etc/systemd/system/${journalUnit}.service.d`;
         runtimeMutated = true;
         if (override) {
-            const alternateUnit = journalUnit === 'hysteria-server' ? 'hysteria' : 'hysteria-server';
-            await removeHysteriaAccessLogOverride(conn, alternateUnit);
-            const mkdirResult = await execSSH(conn, `mkdir -p ${overrideDir}`);
-            if (!mkdirResult.success) {
-                throw new Error(`cannot create Hysteria drop-in directory: ${mkdirResult.output || mkdirResult.error}`);
+            for (const source of journalSources) {
+                const overridePath = hysteriaAccessLogOverridePath(source.unit);
+                const overrideDir = `/etc/systemd/system/${source.unit}.service.d`;
+                const mkdirResult = await execPrivilegedSSH(conn, `mkdir -p ${overrideDir}`);
+                if (!mkdirResult.success) {
+                    throw new Error(`cannot create ${source.unit} Hysteria drop-in directory: ${mkdirResult.output || mkdirResult.error}`);
+                }
+                await uploadPrivilegedFile(conn, override, overridePath, { mode: '644' });
             }
-            await uploadFile(conn, override, overridePath);
         } else {
-            for (const unit of ['hysteria-server', 'hysteria']) {
-                await removeHysteriaAccessLogOverride(conn, unit);
+            for (const source of journalSources) {
+                await removeHysteriaAccessLogOverride(conn, source.unit);
             }
         }
 
-        const daemonReloadResult = await execSSH(conn, 'systemctl daemon-reload');
+        const daemonReloadResult = await execPrivilegedSSH(conn, 'systemctl daemon-reload');
         if (!daemonReloadResult.success) {
             throw new Error(`systemd daemon-reload failed: ${daemonReloadResult.output || daemonReloadResult.error}`);
         }
-        const effectiveEnvironment = await execSSH(
-            conn,
-            `systemctl show ${journalUnit}.service --property=Environment --value`
-        );
-        if (!effectiveEnvironment.success) {
-            throw new Error(`cannot inspect Hysteria environment: ${effectiveEnvironment.output || effectiveEnvironment.error}`);
+        for (const source of journalSources) {
+            const effectiveEnvironment = await execPrivilegedSSH(
+                conn,
+                `systemctl show ${source.unit}.service --property=Environment --value`
+            );
+            if (!effectiveEnvironment.success) {
+                throw new Error(`cannot inspect ${source.unit} Hysteria environment: ${effectiveEnvironment.output || effectiveEnvironment.error}`);
+            }
+            assertHysteriaEffectiveLoggingEnvironment(effectiveEnvironment.output);
         }
-        assertHysteriaEffectiveLoggingEnvironment(effectiveEnvironment.output);
 
         if (manageAgent) {
-            const agentRestartResult = await execSSH(
+            const agentRestartResult = await execPrivilegedSSH(
                 conn,
                 'systemctl restart cc-agent && systemctl is-active cc-agent >/dev/null 2>&1'
             );
@@ -2378,16 +2561,18 @@ async function reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options = {
             throw new Error(`cannot read node clock before Hysteria restart: ${remoteClockResult.output || remoteClockResult.error}`);
         }
 
-        const restartResult = await execSSH(conn, `
-systemctl restart ${journalUnit} || exit 1
+        for (const source of journalSources) {
+            const restartResult = await execPrivilegedSSH(conn, `
+systemctl restart ${source.unit} || exit 1
 for i in 1 2 3 4 5; do
-    systemctl is-active ${journalUnit} >/dev/null 2>&1 && break
+    systemctl is-active ${source.unit} >/dev/null 2>&1 && break
     sleep 1
 done
-systemctl is-active ${journalUnit} >/dev/null 2>&1 || exit 1
+systemctl is-active ${source.unit} >/dev/null 2>&1 || exit 1
 `);
-        if (!restartResult.success) {
-            throw new Error(`service restart failed: ${restartResult.output || restartResult.error}`);
+            if (!restartResult.success) {
+                throw new Error(`${source.unit} service restart failed: ${restartResult.output || restartResult.error}`);
+            }
         }
 
         if (enabled) {
@@ -2395,11 +2580,12 @@ systemctl is-active ${journalUnit} >/dev/null 2>&1 || exit 1
             // UnsetEnvironment or `/usr/bin/env KEY=value` override. Validate
             // the environment of the process that is actually running so debug
             // request events cannot be silently suppressed by a later drop-in.
-            const processEnvironment = await execSSH(conn, `
-PID="$(systemctl show ${journalUnit}.service --property=MainPID --value)"
+            for (const source of journalSources) {
+                const processEnvironment = await execPrivilegedSSH(conn, `
+PID="$(systemctl show ${source.unit}.service --property=MainPID --value)"
 case "$PID" in ''|0|*[!0-9]*) exit 1 ;; esac
 EXECUTABLE="$(readlink -f "/proc/$PID/exe")" || exit 1
-EXPECTED_EXECUTABLE="$(systemctl show ${journalUnit}.service --property=ExecStart --value | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p' | head -n 1)"
+EXPECTED_EXECUTABLE="$(systemctl show ${source.unit}.service --property=ExecStart --value | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p' | head -n 1)"
 [ -n "$EXPECTED_EXECUTABLE" ] || { echo "Cannot resolve Hysteria ExecStart path" >&2; exit 2; }
 EXPECTED_EXECUTABLE="$(readlink -f "$EXPECTED_EXECUTABLE")" || exit 2
 [ "$EXECUTABLE" = "$EXPECTED_EXECUTABLE" ] || {
@@ -2412,22 +2598,23 @@ case "$(basename "$EXECUTABLE")" in
 esac
 cat "/proc/$PID/environ"
 `);
-            if (!processEnvironment.success) {
-                throw new Error(`cannot inspect running Hysteria environment: ${processEnvironment.output || processEnvironment.error}`);
-            }
-            assertHysteriaEffectiveLoggingEnvironment(processEnvironment.output);
+                if (!processEnvironment.success) {
+                    throw new Error(`cannot inspect ${source.unit} running Hysteria environment: ${processEnvironment.output || processEnvironment.error}`);
+                }
+                assertHysteriaEffectiveLoggingEnvironment(processEnvironment.output);
 
-            const journalResult = await execSSH(
-                conn,
-                `journalctl --unit=${journalUnit} --since=@${remoteEpoch} --lines=100 --output=cat --no-pager`
-            );
-            if (!journalResult.success || !hasStructuredHysteriaStartupLog(journalResult.output)) {
-                throw new Error('Hysteria did not emit structured JSON logs; check custom log flags and journald');
+                const journalResult = await execPrivilegedSSH(
+                    conn,
+                    `journalctl --unit=${source.unit} --since=@${remoteEpoch} --lines=100 --output=cat --no-pager`
+                );
+                if (!journalResult.success || !hasStructuredHysteriaStartupLog(journalResult.output)) {
+                    throw new Error(`${source.unit} did not emit structured JSON logs; check custom log flags and journald`);
+                }
             }
         }
 
         log(`${enabled ? 'enabled' : 'disabled'} Hysteria JSON journal shipping`);
-        return { success: true, agentVersion, journalUnit };
+        return { success: true, agentVersion, journalUnit, journalSources };
     } catch (error) {
         if (enabled && runtimeMutated && conn) {
             // Enabling is transactional from the operator's perspective. If a
@@ -2444,17 +2631,21 @@ cat "/proc/$PID/environ"
                         useTls,
                         { ...effectiveAccessLogs, enabled: false, ingestUrl: '', ingestToken: '' }
                     );
-                    await uploadFile(conn, JSON.stringify(disabledConfig, null, 2), '/etc/cc-agent/config.json');
-                    await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+                    await uploadPrivilegedFile(conn, JSON.stringify(disabledConfig, null, 2), '/etc/cc-agent/config.json', { mode: '600' });
                 }
-                for (const unit of ['hysteria-server', 'hysteria']) {
-                    await removeHysteriaAccessLogOverride(conn, unit);
+                const rollbackSources = journalSources.length > 0
+                    ? journalSources : normalizeHysteriaJournalSources(effectiveAccessLogs || accessLogs);
+                for (const source of rollbackSources) {
+                    await removeHysteriaAccessLogOverride(conn, source.unit);
                 }
                 const agentRollback = manageAgent
                     ? 'systemctl restart cc-agent >/dev/null 2>&1 || true' : '';
-                await execSSH(conn, `systemctl daemon-reload >/dev/null 2>&1 || true
+                const hysteriaRollback = rollbackSources
+                    .map(source => `systemctl restart ${source.unit} >/dev/null 2>&1 || true`)
+                    .join('\n');
+                await execPrivilegedSSH(conn, `systemctl daemon-reload >/dev/null 2>&1 || true
 ${agentRollback}
-${journalUnit ? `systemctl restart ${journalUnit} >/dev/null 2>&1 || true` : ''}`);
+${hysteriaRollback}`);
                 log('rolled back failed Hysteria access-log enable');
             } catch (rollbackError) {
                 logger.error(`[AccessLogs] Node ${preparedNode.name}: rollback failed: ${rollbackError.message}`);
@@ -2479,7 +2670,10 @@ module.exports = {
     getNodeLogs,
     connectSSH,
     execSSH,
+    buildPrivilegedShellCommand,
+    execPrivilegedSSH,
     uploadFile,
+    uploadPrivilegedFile,
     readRemoteFileIfExists,
     assertCcAgentConfigContentOwnership,
     assertCcAgentConfigOwnership,
@@ -2494,11 +2688,13 @@ module.exports = {
     reconcileHysteriaAccessLogs,
     HYSTERIA_ACCESS_LOG_OVERRIDE_PATH,
     hysteriaAccessLogOverridePath,
+    normalizeHysteriaJournalSources,
     detectHysteriaSystemdUnit,
     inspectHysteriaSystemdUnits,
     assertHysteriaExecStartLoggingCompatible,
     assertHysteriaEffectiveLoggingEnvironment,
     waitForAgentAccessLogSourceReady,
+    journalSourcesMatchAgentStatus,
     hasStructuredHysteriaStartupLog,
     removeHysteriaAccessLogOverride,
     disableHysteriaAccessLogsRuntime,

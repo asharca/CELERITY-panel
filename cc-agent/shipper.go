@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,20 +53,30 @@ type spoolEvent struct {
 // ShipperStatus is surfaced through GET /info so the panel can display module
 // health without it affecting the node's core health.
 type ShipperStatus struct {
-	Enabled       bool   `json:"enabled"`
-	Source        string `json:"source,omitempty"`
-	Format        string `json:"format,omitempty"`
-	JournalUnit   string `json:"journal_unit,omitempty"`
-	SourceReady   bool   `json:"source_ready"`
-	SpoolBytes    int64  `json:"spool_bytes"`
-	SpoolBatches  int    `json:"spool_batches"`
-	LagBytes      int64  `json:"lag_bytes"`
-	DroppedEvents int64  `json:"dropped_events"`
-	InvalidEvents int64  `json:"invalid_events"`
-	LastShipAt    string `json:"last_ship_at"`
-	LastError     string `json:"last_error"`
-	SourceError   string `json:"source_error,omitempty"`
-	SourceWarning string `json:"source_warning,omitempty"`
+	Enabled        bool                  `json:"enabled"`
+	Source         string                `json:"source,omitempty"`
+	Format         string                `json:"format,omitempty"`
+	JournalUnit    string                `json:"journal_unit,omitempty"`
+	JournalSources []JournalSourceStatus `json:"journal_sources,omitempty"`
+	SourceReady    bool                  `json:"source_ready"`
+	SpoolBytes     int64                 `json:"spool_bytes"`
+	SpoolBatches   int                   `json:"spool_batches"`
+	LagBytes       int64                 `json:"lag_bytes"`
+	DroppedEvents  int64                 `json:"dropped_events"`
+	InvalidEvents  int64                 `json:"invalid_events"`
+	LastShipAt     string                `json:"last_ship_at"`
+	LastError      string                `json:"last_error"`
+	SourceError    string                `json:"source_error,omitempty"`
+	SourceWarning  string                `json:"source_warning,omitempty"`
+}
+
+// JournalSourceStatus exposes readiness independently for each physical HY2
+// runtime without changing the single aggregate shipper health contract.
+type JournalSourceStatus struct {
+	Unit        string `json:"unit"`
+	Tag         string `json:"tag,omitempty"`
+	SourceReady bool   `json:"source_ready"`
+	SourceError string `json:"source_error,omitempty"`
 }
 
 type accessLogSource interface {
@@ -73,6 +84,109 @@ type accessLogSource interface {
 	Stop()
 	LagBytes() int64
 	Ready() bool
+}
+
+type journalTailerBinding struct {
+	unit   string
+	tag    string
+	tailer *JournalTailer
+}
+
+// multiJournalSource keeps independent journal cursors for each configured
+// systemd unit while presenting one small source interface to the shipper.
+// A shared canCheckpoint callback means no cursor advances until the common
+// spool has durably sealed all events emitted by any source.
+type multiJournalSource struct {
+	sources   []journalTailerBinding
+	startOnce sync.Once
+	stopOnce  sync.Once
+	doneCh    chan struct{}
+}
+
+func newMultiJournalSource(sources []journalTailerBinding) *multiJournalSource {
+	return &multiJournalSource{sources: sources, doneCh: make(chan struct{})}
+}
+
+func (m *multiJournalSource) start() {
+	m.startOnce.Do(func() {
+		var wg sync.WaitGroup
+		for _, binding := range m.sources {
+			wg.Add(1)
+			go func(tailer *JournalTailer) {
+				defer wg.Done()
+				tailer.Run()
+			}(binding.tailer)
+		}
+		go func() {
+			wg.Wait()
+			close(m.doneCh)
+		}()
+	})
+}
+
+func (m *multiJournalSource) Run() {
+	m.start()
+	<-m.doneCh
+}
+
+func (m *multiJournalSource) Stop() {
+	m.start()
+	m.stopOnce.Do(func() {
+		for _, binding := range m.sources {
+			binding.tailer.Stop()
+		}
+	})
+	<-m.doneCh
+}
+
+func (m *multiJournalSource) LagBytes() int64 {
+	var total int64
+	for _, binding := range m.sources {
+		total += binding.tailer.LagBytes()
+	}
+	return total
+}
+
+func (m *multiJournalSource) Ready() bool {
+	return len(m.sources) > 0 && allJournalSourcesReady(m.sources)
+}
+
+func allJournalSourcesReady(sources []journalTailerBinding) bool {
+	for _, binding := range sources {
+		if !binding.tailer.Ready() {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *multiJournalSource) Checkpoint() {
+	for _, binding := range m.sources {
+		binding.tailer.Checkpoint()
+	}
+}
+
+func (m *multiJournalSource) LastError() string {
+	var errors []string
+	for _, binding := range m.sources {
+		if message := binding.tailer.LastError(); message != "" {
+			errors = append(errors, binding.unit+": "+message)
+		}
+	}
+	return strings.Join(errors, "; ")
+}
+
+func (m *multiJournalSource) JournalSources() []JournalSourceStatus {
+	result := make([]JournalSourceStatus, 0, len(m.sources))
+	for _, binding := range m.sources {
+		result = append(result, JournalSourceStatus{
+			Unit:        binding.unit,
+			Tag:         binding.tag,
+			SourceReady: binding.tailer.Ready(),
+			SourceError: binding.tailer.LastError(),
+		})
+	}
+	return result
 }
 
 // Shipper batches tailed lines, writes them to a bounded disk spool as
@@ -114,8 +228,28 @@ func NewShipper(cfg *Config) *Shipper {
 	}
 
 	if al.Source == accessLogSourceJournal {
-		cursorPath := filepath.Join(cfg.DataDir, "accesslog-journal-cursor.json")
-		s.source = NewJournalTailer(al.JournalUnit, cursorPath, s.onLines, s.canCheckpoint)
+		sources := al.EffectiveJournalSources()
+		if len(sources) == 1 && sources[0].Tag == "" {
+			// Preserve the cursor path from the initial one-unit implementation so
+			// an in-place agent upgrade does not re-read an entire journal.
+			cursorPath := filepath.Join(cfg.DataDir, "accesslog-journal-cursor.json")
+			s.source = NewJournalTailer(sources[0].Unit, cursorPath, s.onLines, s.canCheckpoint)
+		} else {
+			bindings := make([]journalTailerBinding, 0, len(sources))
+			for _, source := range sources {
+				bindings = append(bindings, journalTailerBinding{
+					unit: source.Unit,
+					tag:  source.Tag,
+					tailer: NewJournalTailer(
+						source.Unit,
+						journalCursorPath(cfg.DataDir, source),
+						s.onLinesForRuntime(source.Tag),
+						s.canCheckpoint,
+					),
+				})
+			}
+			s.source = newMultiJournalSource(bindings)
+		}
 	} else {
 		// Keep the legacy cursor name so existing Xray agents resume exactly
 		// where pre-1.5.0 binaries stopped.
@@ -123,6 +257,11 @@ func NewShipper(cfg *Config) *Shipper {
 		s.source = NewTailer(al.Path, cursorPath, al.FileMaxBytes, s.onLines, s.canCheckpoint)
 	}
 	return s
+}
+
+func journalCursorPath(dataDir string, source JournalSource) string {
+	sum := sha256.Sum256([]byte(source.Unit + "\x00" + source.Tag))
+	return filepath.Join(dataDir, "accesslog-journal-"+hex.EncodeToString(sum[:8])+"-cursor.json")
 }
 
 // canCheckpoint reports that every accepted line emitted so far is durably in a
@@ -149,7 +288,7 @@ func (s *Shipper) onLines(lines []rawLine) {
 	} else if s.cfg.Format == accessLogFormatHysteria2JSON {
 		normalized := make([]rawLine, 0, len(lines))
 		for _, line := range lines {
-			accessLine, result := normalizeHysteria2AccessLineDetailed(line.Line)
+			accessLine, result := normalizeHysteria2AccessLineForRuntime(line.Line, line.Runtime)
 			if result != hysteria2NormalizeAccepted {
 				if result == hysteria2NormalizeInvalid {
 					s.mu.Lock()
@@ -175,6 +314,15 @@ func (s *Shipper) onLines(lines []rawLine) {
 	}
 }
 
+func (s *Shipper) onLinesForRuntime(runtime string) func([]rawLine) {
+	return func(lines []rawLine) {
+		for index := range lines {
+			lines[index].Runtime = runtime
+		}
+		s.onLines(lines)
+	}
+}
+
 func (s *Shipper) Start() {
 	if err := os.MkdirAll(s.spoolDir, 0755); err != nil {
 		log.Printf("[shipper] cannot create spool dir: %v", err)
@@ -182,10 +330,22 @@ func (s *Shipper) Start() {
 	go s.source.Run()
 	go s.run()
 	if s.cfg.Source == accessLogSourceJournal {
-		log.Printf("[shipper] access-log shipping started (journal=%s format=%s url=%s)", s.cfg.JournalUnit, s.cfg.Format, s.cfg.IngestURL)
+		log.Printf("[shipper] access-log shipping started (journals=%s format=%s url=%s)", journalSourceDescription(s.cfg), s.cfg.Format, s.cfg.IngestURL)
 	} else {
 		log.Printf("[shipper] access-log shipping started (path=%s format=%s url=%s)", s.cfg.Path, s.cfg.Format, s.cfg.IngestURL)
 	}
+}
+
+func journalSourceDescription(cfg *AccessLogsConfig) string {
+	parts := make([]string, 0, len(cfg.EffectiveJournalSources()))
+	for _, source := range cfg.EffectiveJournalSources() {
+		if source.Tag == "" {
+			parts = append(parts, source.Unit)
+		} else {
+			parts = append(parts, source.Unit+"@"+source.Tag)
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 // Stop drains the tailer, flushes pending lines, and stops delivery.
@@ -557,20 +717,21 @@ func (s *Shipper) Status() ShipperStatus {
 		last = s.lastShipAt.Format(time.RFC3339)
 	}
 	return ShipperStatus{
-		Enabled:       true,
-		Source:        s.cfg.Source,
-		Format:        s.cfg.Format,
-		JournalUnit:   journalUnitForStatus(s.cfg),
-		SourceReady:   s.source.Ready(),
-		SpoolBytes:    total,
-		SpoolBatches:  len(files),
-		LagBytes:      s.source.LagBytes(),
-		DroppedEvents: s.droppedEvents,
-		InvalidEvents: s.invalidEvents,
-		LastShipAt:    last,
-		LastError:     s.lastError,
-		SourceError:   accessLogSourceError(s.source),
-		SourceWarning: accessLogSourceWarning(s.source),
+		Enabled:        true,
+		Source:         s.cfg.Source,
+		Format:         s.cfg.Format,
+		JournalUnit:    journalUnitForStatus(s.cfg),
+		JournalSources: journalSourcesForStatus(s.cfg, s.source),
+		SourceReady:    s.source.Ready(),
+		SpoolBytes:     total,
+		SpoolBatches:   len(files),
+		LagBytes:       s.source.LagBytes(),
+		DroppedEvents:  s.droppedEvents,
+		InvalidEvents:  s.invalidEvents,
+		LastShipAt:     last,
+		LastError:      s.lastError,
+		SourceError:    accessLogSourceError(s.source),
+		SourceWarning:  accessLogSourceWarning(s.source),
 	}
 }
 
@@ -579,6 +740,20 @@ func journalUnitForStatus(cfg *AccessLogsConfig) string {
 		return cfg.JournalUnit
 	}
 	return ""
+}
+
+func journalSourcesForStatus(cfg *AccessLogsConfig, source accessLogSource) []JournalSourceStatus {
+	if cfg.Source != accessLogSourceJournal {
+		return nil
+	}
+	if reporter, ok := source.(interface{ JournalSources() []JournalSourceStatus }); ok {
+		return reporter.JournalSources()
+	}
+	return []JournalSourceStatus{{
+		Unit:        cfg.JournalUnit,
+		SourceReady: source.Ready(),
+		SourceError: accessLogSourceError(source),
+	}}
 }
 
 func accessLogSourceError(source accessLogSource) string {

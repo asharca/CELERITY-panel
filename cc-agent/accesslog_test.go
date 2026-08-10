@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -164,5 +165,40 @@ func TestShipperFlushSealsSpoolBeforeFileCursorCheckpoint(t *testing.T) {
 	}
 	if _, err := os.Stat(cursorPath); err != nil {
 		t.Fatalf("cursor not checkpointed after durable spool: %v", err)
+	}
+}
+
+func TestShipperBuildsIndependentTaggedJournalSources(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{DataDir: dir, AccessLogs: AccessLogsConfig{
+		Source:      accessLogSourceJournal,
+		Format:      accessLogFormatHysteria2JSON,
+		JournalUnit: "hysteria-server",
+		JournalSources: []JournalSource{
+			{Unit: "hysteria-server", Tag: "main"},
+			{Unit: "hysteria-server@mobile", Tag: "mobile"},
+		},
+		BatchMaxEvents: 500,
+		SpoolMaxBytes:  1024 * 1024,
+	}}
+	shipper := NewShipper(cfg)
+	multi, ok := shipper.source.(*multiJournalSource)
+	if !ok {
+		t.Fatalf("source type = %T, want *multiJournalSource", shipper.source)
+	}
+	if len(multi.sources) != 2 || multi.sources[0].tailer.cursorPath == multi.sources[1].tailer.cursorPath {
+		t.Fatalf("multi source cursors = %#v", multi.sources)
+	}
+	status := shipper.Status()
+	if len(status.JournalSources) != 2 || status.JournalSources[1].Unit != "hysteria-server@mobile" || status.JournalSources[1].Tag != "mobile" {
+		t.Fatalf("journal source status = %#v", status.JournalSources)
+	}
+
+	shipper.onLinesForRuntime("mobile")([]rawLine{{
+		Offset: 1,
+		Line:   `{"time":1786350896789,"msg":"TCP request","addr":"203.0.113.1:123","id":"user","reqAddr":"example.com:443"}`,
+	}})
+	if len(shipper.pending) != 1 || !strings.Contains(shipper.pending[0].Line, "[hysteria2/mobile -> direct]") {
+		t.Fatalf("tagged pending record = %#v", shipper.pending)
 	}
 }

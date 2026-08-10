@@ -184,6 +184,13 @@ const (
 )
 
 func normalizeHysteria2AccessLineDetailed(line string) (string, hysteria2NormalizeResult) {
+	return normalizeHysteria2AccessLineForRuntime(line, "")
+}
+
+// normalizeHysteria2AccessLineForRuntime is the multi-runtime variant of the
+// legacy normalizer. Empty runtime preserves the old `hysteria2` tag exactly;
+// a validated runtime keeps parallel HY2 units distinguishable in ClickHouse.
+func normalizeHysteria2AccessLineForRuntime(line, runtime string) (string, hysteria2NormalizeResult) {
 	event, err := parseHysteria2Event(line)
 	if err != nil || event.Kind != hysteria2EventRequest {
 		return "", hysteria2NormalizeIgnored
@@ -191,10 +198,16 @@ func normalizeHysteria2AccessLineDetailed(line string) (string, hysteria2Normali
 	if event.Time.IsZero() || !safeAccessID(event.ID) || !validHostPortToken(event.Addr) || !validHostPortToken(event.ReqAddr) {
 		return "", hysteria2NormalizeInvalid
 	}
+	if runtime != "" && !journalSourceTagRE.MatchString(runtime) {
+		return "", hysteria2NormalizeInvalid
+	}
 
 	inboundTag := "hysteria2"
+	if runtime != "" {
+		inboundTag += "/" + runtime
+	}
 	if event.Network == "udp" {
-		inboundTag = fmt.Sprintf("hysteria2/session-%d", event.SessionID)
+		inboundTag = fmt.Sprintf("%s/session-%d", inboundTag, event.SessionID)
 	}
 
 	return fmt.Sprintf(

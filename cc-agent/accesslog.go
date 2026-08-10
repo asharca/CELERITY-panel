@@ -31,8 +31,9 @@ type cursorState struct {
 // treats delivery as at-least-once and does not use this field for per-event
 // deduplication.
 type rawLine struct {
-	Offset int64  `json:"offset"`
-	Line   string `json:"line"`
+	Offset  int64  `json:"offset"`
+	Line    string `json:"line"`
+	Runtime string `json:"-"`
 }
 
 // Tailer follows the Xray access log and emits completed lines to a callback.
