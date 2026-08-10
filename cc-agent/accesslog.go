@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -25,47 +26,61 @@ type cursorState struct {
 	Offset int64  `json:"offset"`
 }
 
-// rawLine is a single completed access-log line with the byte offset at which
-// it started. The offset feeds the deterministic event id on the panel so
-// retries dedup while genuine repeats stay distinct.
+// rawLine is a single completed access-log line with a stable source position:
+// a byte offset for files or a hash of the journal cursor. The panel currently
+// treats delivery as at-least-once and does not use this field for per-event
+// deduplication.
 type rawLine struct {
 	Offset int64  `json:"offset"`
 	Line   string `json:"line"`
 }
 
-// Tailer follows the Xray access log, emits completed lines to a callback, and
-// performs agent-managed rotation. It is safe to Stop() and re-create.
+// Tailer follows the Xray access log and emits completed lines to a callback.
+// It never mutates the source file: Xray keeps an O_APPEND descriptor open, so
+// in-place truncation has an unavoidable race with the active writer.
 type Tailer struct {
 	path       string
 	cursorPath string
 	maxBytes   int64
 
 	mu     sync.Mutex
+	saveMu sync.Mutex
 	cursor cursorState
+	dirty  bool
 
 	stopCh chan struct{}
 	doneCh chan struct{}
 
-	// canTruncate reports whether the shipper has durably handled everything
-	// up to the current offset, so an in-place truncate will not lose data.
-	canTruncate func() bool
+	// canCheckpoint reports whether emitted lines have reached a sealed spool
+	// file. Persisting the read offset before that point would skip events after
+	// a process crash.
+	canCheckpoint func() bool
 
 	// emit receives batches of completed lines.
 	emit func([]rawLine)
 
 	// lagBytes exposes how far behind end-of-file the reader is (for status).
-	lagBytes int64
+	lagBytes           int64
+	ready              bool
+	lastError          string
+	sizeWarning        string
+	limitWarningLogged bool
 }
 
-func NewTailer(path, cursorPath string, maxBytes int64, emit func([]rawLine), canTruncate func() bool) *Tailer {
+func NewTailer(
+	path, cursorPath string,
+	maxBytes int64,
+	emit func([]rawLine),
+	canCheckpoint func() bool,
+) *Tailer {
 	return &Tailer{
-		path:        path,
-		cursorPath:  cursorPath,
-		maxBytes:    maxBytes,
-		emit:        emit,
-		canTruncate: canTruncate,
-		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
+		path:          path,
+		cursorPath:    cursorPath,
+		maxBytes:      maxBytes,
+		emit:          emit,
+		canCheckpoint: canCheckpoint,
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
 	}
 }
 
@@ -84,13 +99,26 @@ func (t *Tailer) loadCursor() {
 	var c cursorState
 	if json.Unmarshal(data, &c) == nil {
 		t.cursor = c
+		t.dirty = false
 	}
 }
 
 func (t *Tailer) saveCursor() {
+	t.saveMu.Lock()
+	defer t.saveMu.Unlock()
+
 	t.mu.Lock()
+	if !t.dirty {
+		t.mu.Unlock()
+		return
+	}
 	c := t.cursor
 	t.mu.Unlock()
+	// Snapshot before checking durability. readAvailable always emits before it
+	// advances cursor, so this snapshot can never refer to an unseen line.
+	if t.canCheckpoint != nil && !t.canCheckpoint() {
+		return
+	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		return
@@ -98,15 +126,81 @@ func (t *Tailer) saveCursor() {
 	_ = os.MkdirAll(filepath.Dir(t.cursorPath), 0755)
 	tmp := t.cursorPath + ".tmp"
 	if os.WriteFile(tmp, data, 0600) == nil {
-		_ = os.Rename(tmp, t.cursorPath)
+		if os.Rename(tmp, t.cursorPath) == nil {
+			t.mu.Lock()
+			if t.cursor == c {
+				t.dirty = false
+			}
+			t.mu.Unlock()
+		}
 	}
 }
+
+// Checkpoint persists the latest read position once the shipper confirms that
+// all emitted lines are durably spooled.
+func (t *Tailer) Checkpoint() { t.saveCursor() }
 
 // LagBytes returns how far behind end-of-file the tailer currently is.
 func (t *Tailer) LagBytes() int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.lagBytes
+}
+
+// Ready is true only after the configured file has been opened successfully.
+// A missing/unreadable file remains an observable source failure rather than a
+// misleadingly healthy enabled module.
+func (t *Tailer) Ready() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ready
+}
+
+func (t *Tailer) LastError() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastError
+}
+
+// Warning reports a non-fatal source condition. The size threshold is only an
+// operational warning; it must not make the source unhealthy or trigger a
+// restart loop in the panel.
+func (t *Tailer) Warning() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sizeWarning
+}
+
+func (t *Tailer) updateSizeWarning(size int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.maxBytes <= 0 || size < t.maxBytes {
+		t.sizeWarning = ""
+		t.limitWarningLogged = false
+		return
+	}
+	t.sizeWarning = fmt.Sprintf(
+		"access log is %d bytes (warning threshold %d); configure external rotation with a coordinated Xray logger reopen",
+		size,
+		t.maxBytes,
+	)
+	if !t.limitWarningLogged {
+		log.Printf("[accesslog] %s", t.sizeWarning)
+		t.limitWarningLogged = true
+	}
+}
+
+func (t *Tailer) setSourceState(ready bool, message string) {
+	t.mu.Lock()
+	t.ready = ready
+	t.lastError = message
+	t.mu.Unlock()
+}
+
+func (t *Tailer) setReady(ready bool) {
+	t.mu.Lock()
+	t.ready = ready
+	t.mu.Unlock()
 }
 
 func (t *Tailer) Stop() {
@@ -120,8 +214,12 @@ func (t *Tailer) Stop() {
 
 // Run reads new lines in a loop until Stop() is called.
 func (t *Tailer) Run() {
-	defer close(t.doneCh)
+	defer func() {
+		t.setReady(false)
+		close(t.doneCh)
+	}()
 	t.loadCursor()
+	t.readAvailable()
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -133,7 +231,6 @@ func (t *Tailer) Run() {
 			return
 		case <-ticker.C:
 			t.readAvailable()
-			t.maybeRotate()
 		}
 	}
 }
@@ -143,19 +240,34 @@ func (t *Tailer) Run() {
 func (t *Tailer) readAvailable() {
 	fi, err := os.Stat(t.path)
 	if err != nil {
+		t.setSourceState(false, err.Error())
 		return
 	}
 	dev, ino := fileIdentity(fi)
+	t.updateSizeWarning(fi.Size())
 
 	t.mu.Lock()
 	// Detect recreation (new inode) or truncation (file shorter than offset).
 	if dev != t.cursor.Device || ino != t.cursor.Inode {
 		t.cursor = cursorState{Device: dev, Inode: ino, Offset: 0}
+		t.dirty = true
 	} else if fi.Size() < t.cursor.Offset {
 		t.cursor.Offset = 0
+		t.dirty = true
 	}
 	startOffset := t.cursor.Offset
 	t.mu.Unlock()
+
+	// Open even when there are no new bytes. Stat alone does not prove that the
+	// agent can read the configured source, so readiness is asserted only after
+	// this succeeds.
+	f, err := os.Open(t.path)
+	if err != nil {
+		t.setSourceState(false, err.Error())
+		return
+	}
+	defer f.Close()
+	t.setSourceState(true, "")
 
 	if fi.Size() <= startOffset {
 		t.mu.Lock()
@@ -164,19 +276,15 @@ func (t *Tailer) readAvailable() {
 		return
 	}
 
-	f, err := os.Open(t.path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
 	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		t.setSourceState(false, err.Error())
 		return
 	}
 
 	reader := bufio.NewReader(f)
 	offset := startOffset
 	batch := make([]rawLine, 0, 256)
+	var readErr error
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -186,6 +294,7 @@ func (t *Tailer) readAvailable() {
 			break
 		}
 		if err != nil {
+			readErr = err
 			break
 		}
 		lineStart := offset
@@ -213,43 +322,20 @@ func (t *Tailer) readAvailable() {
 
 	t.mu.Lock()
 	t.cursor.Offset = offset
+	t.cursor.Device = dev
+	t.cursor.Inode = ino
+	t.cursorDirtyIfChanged(startOffset, offset)
 	t.lagBytes = fi.Size() - offset
 	t.mu.Unlock()
 	t.saveCursor()
+	if readErr != nil {
+		t.setSourceState(false, readErr.Error())
+	}
 }
 
-// maybeRotate truncates the access log in place once it exceeds the size cap and
-// has been fully consumed. Truncating only when size == offset AND the shipper
-// has durably handled everything keeps the loss window minimal (smaller than
-// logrotate copytruncate) without an external rotation tool.
-func (t *Tailer) maybeRotate() {
-	fi, err := os.Stat(t.path)
-	if err != nil {
-		return
+// cursorDirtyIfChanged is called with t.mu held.
+func (t *Tailer) cursorDirtyIfChanged(previous, current int64) {
+	if previous != current {
+		t.dirty = true
 	}
-	if fi.Size() < t.maxBytes {
-		return
-	}
-
-	t.mu.Lock()
-	fullyRead := fi.Size() == t.cursor.Offset
-	t.mu.Unlock()
-
-	if !fullyRead {
-		return
-	}
-	if t.canTruncate != nil && !t.canTruncate() {
-		// Shipper still has pending/unacked data; defer truncation.
-		return
-	}
-
-	if err := os.Truncate(t.path, 0); err != nil {
-		log.Printf("[accesslog] truncate failed: %v", err)
-		return
-	}
-	t.mu.Lock()
-	t.cursor.Offset = 0
-	t.mu.Unlock()
-	t.saveCursor()
-	log.Printf("[accesslog] rotated access log in place (was %d bytes)", fi.Size())
 }

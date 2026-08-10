@@ -279,11 +279,15 @@ class SyncService {
         const currentTask = previousTask.catch(() => {}).then(task);
 
         this.nodePushQueues.set(queueKey, currentTask);
-        currentTask.finally(() => {
+        const cleanup = () => {
             if (this.nodePushQueues.get(queueKey) === currentTask) {
                 this.nodePushQueues.delete(queueKey);
             }
-        });
+        };
+        // Do not discard Promise.prototype.finally() here: its derived promise
+        // rejects when the task rejects and would surface as an unhandled
+        // rejection even when the caller correctly catches currentTask.
+        currentTask.then(cleanup, cleanup);
         return currentTask;
     }
 
@@ -507,7 +511,7 @@ class SyncService {
      * SSH is only used for the config upload. If agent is not yet installed,
      * falls back to SSH restart.
      */
-    async updateXrayNodeConfig(node) {
+    async updateXrayNodeConfig(node, options = {}) {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
         const failSync = async message => {
@@ -536,6 +540,20 @@ class SyncService {
             }
             return failSync(genErr.message);
         }
+
+        // A legacy file tailer must stay alive until Xray has reopened access
+        // output on journald. Anchor the journal first, restart Xray, and only
+        // then switch/restart cc-agent; otherwise requests in that transition
+        // window would be left in the old file after its tailer stopped.
+        const migrateFileAccessLogToJournal = !!(
+            node.xray?.accessLogs?.enabled
+            && (
+                options.previousAccessLogSource === 'file'
+                || node.xray?.accessLogs?.appliedSource === 'xray-file'
+                || node.xray?.accessLogs?.pendingSource === 'xray-file'
+            )
+        );
+        let agentReloadDeferred = false;
 
         // Step 1: Upload config.json via SSH (only if SSH is configured)
         const hasSsh = !!(node.ssh?.password || node.ssh?.privateKey);
@@ -591,23 +609,6 @@ class SyncService {
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
                 }
 
-                // When access logging is enabled, the log directory must exist
-                // and be writable by the Xray service user (User=nobody in the
-                // systemd unit) BEFORE Xray restarts with the new config —
-                // otherwise Xray fails to start and the node goes down.
-                if (node.xray?.accessLogs?.enabled) {
-                    try {
-                        await ssh.exec(
-                            'mkdir -p /var/log/xray && '
-                            + 'chown nobody /var/log/xray 2>/dev/null || chown nobody:nogroup /var/log/xray 2>/dev/null || true; '
-                            + 'chmod 755 /var/log/xray; '
-                            + 'touch /var/log/xray/access.log && chown nobody /var/log/xray/access.log 2>/dev/null || true'
-                        );
-                    } catch (dirErr) {
-                        logger.warn(`[Xray Sync] Node ${node.name}: access-log dir prep failed: ${dirErr.message}`);
-                    }
-                }
-
                 // Xray config always goes to /usr/local/etc/xray/config.json
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
                 await ssh.uploadContent(configContent, xrayConfigPath);
@@ -617,10 +618,38 @@ class SyncService {
                 // changed, so the agent picks up new tag→flow mapping. The
                 // helper restarts cc-agent via systemctl; safe to call always.
                 if (node.xray?.agentToken) {
-                    try {
+                    if (migrateFileAccessLogToJournal) {
+                        const cursorPath = '/var/lib/cc-agent/accesslog-journal-cursor.json';
+                        let hasBaseline = false;
+                        try {
+                            const existingCursor = JSON.parse(await ssh.readFile(cursorPath));
+                            hasBaseline = !!(existingCursor.cursor || Number(existingCursor.realtime_usec) > 0);
+                        } catch (_) {
+                            hasBaseline = false;
+                        }
+                        if (!hasBaseline) {
+                            const clock = await ssh.exec('date +%s');
+                            const seconds = Number.parseInt(clock?.stdout, 10);
+                            if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+                                throw new Error('cannot anchor Xray journal migration: invalid remote clock');
+                            }
+                            const tempCursor = `${cursorPath}.celerity-migrate.tmp`;
+                            await ssh.uploadContent(JSON.stringify({
+                                cursor: '',
+                                realtime_usec: seconds * 1000000,
+                            }), tempCursor);
+                            const anchored = await ssh.exec(
+                                `mkdir -p /var/lib/cc-agent && chmod 600 ${tempCursor} && `
+                                + `mv -f ${tempCursor} ${cursorPath} && `
+                                + '(sync -f /var/lib/cc-agent 2>/dev/null || sync)'
+                            );
+                            if (!anchored || anchored.code !== 0) {
+                                throw new Error(anchored?.stderr || anchored?.stdout || 'cannot persist Xray journal baseline');
+                            }
+                        }
+                        agentReloadDeferred = true;
+                    } else {
                         await nodeSetup.reloadCcAgent(node, ssh);
-                    } catch (reloadErr) {
-                        logger.warn(`[Xray Sync] Node ${node.name}: cc-agent reload failed: ${reloadErr.message}`);
                     }
                 }
             } catch (error) {
@@ -653,6 +682,18 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {
                 return failSync(`SSH restart failed: ${error.message}`);
+            } finally {
+                ssh.disconnect();
+            }
+        }
+
+        if (agentReloadDeferred) {
+            const ssh = new NodeSSH(node);
+            try {
+                await ssh.connect();
+                await nodeSetup.reloadCcAgent(node, ssh);
+            } catch (error) {
+                return failSync(`Agent journal-source migration failed: ${error.message}`);
             } finally {
                 ssh.disconnect();
             }

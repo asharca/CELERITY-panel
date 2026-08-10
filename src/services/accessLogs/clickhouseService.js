@@ -36,7 +36,7 @@ try {
 let _client = null;
 let _clientKey = '';
 
-// Regex that parses a raw Xray access-log line inside ClickHouse (RE2 engine):
+// Regex that parses the normalized Xray/Hysteria access-log line inside ClickHouse (RE2 engine):
 // no named groups, explicit capture order:
 //   1 ts, 2 src, 3 action, 4 network, 5 dest, 6 route(optional), 7 email(optional)
 // The source (group 2) may carry a leading "tcp:"/"udp:" protocol prefix; the
@@ -50,7 +50,7 @@ const CH_LINE_RE =
     '(accepted|rejected|blocked)\\s+' +
     '(tcp|udp)\\s*:\\s*(\\S+?)' +
     '(?:\\s+\\[([^\\]]*)\\])?' +
-    '(?:\\s+email:\\s*(\\S+))?' +
+    '(?:\\s+email:\\s*(\\S(?:.*\\S)?))?' +
     '\\s*$';
 
 // Fallback for connection-level error lines that are NOT access records, e.g.:
@@ -76,9 +76,9 @@ function sqlString(s) {
 // the stale one). The version is part of the MV name; ensureSchema drops any
 // older names listed here. Bump MV_VERSION whenever the MV definition changes
 // and append the previous name to LEGACY_MV_NAMES.
-const MV_VERSION = 4;
+const MV_VERSION = 5;
 const MV_NAME = `access_events_mv_v${MV_VERSION}`;
-const LEGACY_MV_NAMES = ['access_events_mv', 'access_events_mv_v2', 'access_events_mv_v3'];
+const LEGACY_MV_NAMES = ['access_events_mv', 'access_events_mv_v2', 'access_events_mv_v3', 'access_events_mv_v4'];
 
 // ── Config ────────────────────────────────────────────────────────────────
 

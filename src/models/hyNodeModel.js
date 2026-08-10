@@ -241,15 +241,22 @@ const xrayConfigSchema = new mongoose.Schema({
     // main inbound is still defined by the flat fields above.
     extraInbounds: { type: [xrayExtraInboundSchema], default: [] },
 
-    // Per-node access-log shipping state. Independent of the node's core
-    // health: a shipping failure never marks the node offline.
+    // Per-node access-log shipping state. Kept under `xray` for schema/backward
+    // compatibility, but also used by Hysteria journal shipping. Independent
+    // of core health: a shipping failure never marks the node offline.
     accessLogs: {
         // Effective state for THIS node (may lag the global setting while
         // reconciliation is in progress or the agent is too old).
         enabled: { type: Boolean, default: false },
+        // Set before node deletion so every concurrent reconcile treats the
+        // desired state as disabled until remote cleanup and DB deletion finish.
+        deletePending: { type: Boolean, default: false },
+        // Conservative tombstone: true means a remote source may still be
+        // collecting and must be disabled before deleting/converting the node.
+        cleanupRequired: { type: Boolean, default: false },
         status: {
             type: String,
-            enum: ['disabled', 'pending', 'active', 'degraded', 'error', 'agent-outdated'],
+            enum: ['disabled', 'pending', 'active', 'degraded', 'error', 'agent-outdated', 'agent-missing'],
             default: 'disabled',
         },
         // Per-node ingest credential. Encrypted at rest for re-provisioning;
@@ -261,6 +268,50 @@ const xrayConfigSchema = new mongoose.Schema({
         // (enabled + ingest URL + token). Reconciliation skips the expensive
         // config push + Xray restart when the fingerprint is unchanged.
         appliedFingerprint: { type: String, default: '' },
+        // Runtime that was actually provisioned. Unlike the node's current
+        // type, this survives a later type/role conversion long enough for the
+        // old service to be torn down safely.
+        appliedSource: {
+            type: String,
+            enum: ['', 'xray-file', 'xray-journal', 'hysteria-journal'],
+            default: '',
+        },
+        // SSH target on which the source was provisioned. Kept separately so
+        // changing a node to virtual (which clears node.ip) still leaves enough
+        // information to remove the old HY2 debug drop-in remotely.
+        appliedIp: { type: String, default: '', trim: true },
+        // Encrypted SSH credentials belonging to appliedIp. A node update may
+        // replace node.ssh at the same time as its IP; keeping the old runtime
+        // credentials here lets a later reconcile/delete (including after a
+        // panel restart) disable the exact host that was provisioned.
+        appliedSsh: {
+            port: { type: Number, default: 22 },
+            username: { type: String, default: 'root' },
+            privateKey: { type: String, default: '' },
+            password: { type: String, default: '' },
+        },
+        // Write-ahead marker persisted before enabling a new remote runtime.
+        // If the process/DB commit fails, deletion and later reconciles still
+        // know the exact host that may need teardown.
+        pendingSource: {
+            type: String,
+            enum: ['', 'xray-file', 'xray-journal', 'hysteria-journal'],
+            default: '',
+        },
+        pendingIp: { type: String, default: '', trim: true },
+        pendingSsh: {
+            port: { type: Number, default: 22 },
+            username: { type: String, default: 'root' },
+            privateKey: { type: String, default: '' },
+            password: { type: String, default: '' },
+        },
+        // Effective systemd unit used by HY2 journal shipping. Empty means the
+        // current official default and is detected on first reconciliation.
+        journalUnit: {
+            type: String,
+            enum: ['', 'hysteria-server', 'hysteria'],
+            default: '',
+        },
         lastError: { type: String, default: '' },
         lastBatchAt: { type: Date, default: null },
         spoolBytes: { type: Number, default: 0 },

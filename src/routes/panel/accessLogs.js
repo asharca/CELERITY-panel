@@ -60,9 +60,9 @@ router.get('/access-logs', async (req, res) => {
         const HyNode = require('../../models/hyNodeModel');
         const settings = await Settings.get();
         const nodes = await HyNode.find({
-            type: 'xray',
+            type: { $in: ['xray', 'hysteria'] },
             cascadeRole: { $in: ['standalone', 'portal'] },
-        }).select('name xray.accessLogs.status xray.accessLogs.lastBatchAt').lean();
+        }).select('name type xray.accessLogs.status xray.accessLogs.lastBatchAt').lean();
 
         render(res, 'access-logs', {
             title: res.locals.t?.('accessLogs.pageTitle') || 'Access logs',
@@ -168,9 +168,9 @@ router.get('/access-logs/api/status', async (req, res) => {
 
         const settings = await Settings.get();
         const nodes = await HyNode.find({
-            type: 'xray',
+            type: { $in: ['xray', 'hysteria'] },
             cascadeRole: { $in: ['standalone', 'portal'] },
-        }).select('name agentVersion xray.accessLogs').lean();
+        }).select('name type agentVersion xray.accessLogs').lean();
 
         const spool = await spoolService.spoolSize();
         const chAvailable = await clickhouse.isAvailable();
@@ -184,6 +184,7 @@ router.get('/access-logs/api/status', async (req, res) => {
             nodes: nodes.map(n => ({
                 id: String(n._id),
                 name: n.name,
+                type: n.type,
                 agentVersion: n.agentVersion || '',
                 status: n.xray?.accessLogs?.status || 'disabled',
                 lastBatchAt: n.xray?.accessLogs?.lastBatchAt || null,
@@ -198,30 +199,11 @@ router.get('/access-logs/api/status', async (req, res) => {
 
 router.post('/access-logs/api/purge', async (req, res) => {
     try {
-        const fsp = require('fs/promises');
-        const paths = require('../../services/accessLogs/paths');
-        const clickhouse = require('../../services/accessLogs/clickhouseService');
-
-        // Drop stored events in ClickHouse (keeps the schema).
-        try {
-            await clickhouse.truncate();
-        } catch (e) {
-            logger.warn(`[AccessLogs] purge: ClickHouse truncate skipped: ${e.message}`);
-        }
-
-        // Clear the local incoming spool so pending batches are not re-inserted.
-        await fsp.rm(paths.INCOMING_DIR, { recursive: true, force: true });
-        await fsp.mkdir(paths.INCOMING_DIR, { recursive: true });
-
-        // Reset the aggregate ingest counters so the settings dashboard reflects
-        // the now-empty dataset.
-        const Settings = require('../../models/settingsModel');
-        await Settings.update({
-            'accessLogs.stats.ingestedBatches': 0,
-            'accessLogs.stats.rejectedBatches': 0,
-            'accessLogs.stats.duplicateBatches': 0,
-            'accessLogs.stats.lastIngestAt': null,
-        });
+        // Purge shares the storage lock used by ingest + drain. This guarantees
+        // a batch already read by the processor cannot be inserted after the
+        // truncate and resurrect data the administrator just deleted.
+        const processService = require('../../services/accessLogs/processService');
+        await processService.purgeStoredData();
 
         logger.info('[AccessLogs] stored dataset purged by admin');
         res.json({ ok: true });

@@ -412,6 +412,7 @@ async function manageNode(args, emit) {
             const node = new HyNode(nodeData);
             await node.save();
             await invalidateNodesCache();
+            require('../../services/accessLogs/provisionService').scheduleReconcile();
             logger.info(`[MCP] Created ${nodeType} node ${data.name} (${nodeType === 'virtual' ? 'virtual' : data.ip})`);
             return { success: true, node };
         }
@@ -451,13 +452,16 @@ async function manageNode(args, emit) {
             // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
             if (data.xray && typeof data.xray === 'object') {
                 for (const [k, v] of Object.entries(data.xray)) {
+                    if (['accessLogs', 'agentToken'].includes(k)) continue;
                     updates[`xray.${k}`] = v;
                 }
             }
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            const existing = await HyNode.findById(id).select('type ip domain virtual port portRange active ssh').lean();
+            const existing = await HyNode.findById(id)
+                .select('name type ip domain virtual port portRange active ssh xray')
+                .lean();
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
             const nextType = updates.type || existing.type;
@@ -494,6 +498,16 @@ async function manageNode(args, emit) {
                 previousActive: existing.active,
                 previousSsh: existing.ssh,
             });
+            require('../../services/accessLogs/provisionService').scheduleReconcile({
+                previousNode: {
+                    _id: id,
+                    name: existing.name,
+                    type: existing.type,
+                    ip: existing.ip,
+                    ssh: existing.ssh,
+                    xray: existing.xray || {},
+                },
+            });
 
             logger.info(`[MCP] Updated node ${node.name}`);
             return { success: true, node };
@@ -501,7 +515,19 @@ async function manageNode(args, emit) {
 
         case 'delete': {
             if (!id) throw new Error('id is required for delete');
-            const node = await HyNode.findByIdAndDelete(id);
+            const existing = await HyNode.findById(id);
+            if (!existing) return { error: `Node '${id}' not found`, code: 404 };
+            let node;
+            try {
+                node = await require('../../services/accessLogs/provisionService')
+                    .deleteNodeWithAccessLogCleanup(existing);
+            } catch (error) {
+                logger.error(`[MCP] Refusing to delete ${existing.name}: access-log cleanup failed: ${error.message}`);
+                return {
+                    error: `Remote access-log cleanup failed; node was not deleted: ${error.message}`,
+                    code: 409,
+                };
+            }
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             getSyncService().schedulePortHoppingCleanup(node);
             await HyUser.updateMany({ nodes: node._id }, { $pull: { nodes: node._id } });

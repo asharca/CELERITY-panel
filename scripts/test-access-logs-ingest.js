@@ -72,6 +72,28 @@ try { require('mongoose').set('bufferTimeoutMS', 1); } catch (_) { /* mongoose o
     assert.ok(masked.includes('1.2.3.0'), 'masked to /24');
     assert.ok(!masked.includes('1.2.3.4:'), 'original source ip scrubbed');
 
+    // HY2's net.Addr uses bracketed IPv6 endpoints. The complete address must
+    // be masked rather than only the text before the first colon.
+    const hy2V6 = line.replace('1.2.3.4:5555', '[2001:db8:abcd:12:34::1]:5555');
+    const maskedV6 = processService.maskRawLine(hy2V6);
+    assert.ok(maskedV6.includes('[2001:db8:abcd::]:5555'), 'bracketed IPv6 endpoint masked');
+    assert.ok(!maskedV6.includes('abcd:12:34'), 'exact IPv6 suffix scrubbed');
+
+    const prefixedV6 = line.replace('1.2.3.4:5555', 'tcp:[2001:db8:abcd:12::9]:5555');
+    const maskedPrefixedV6 = processService.maskRawLine(prefixedV6);
+    assert.ok(maskedPrefixedV6.includes('tcp:[2001:db8:abcd::]:5555'), 'transport prefix preserved');
+
+    const compressedV6 = line.replace('1.2.3.4:5555', '[2001::dead:beef]:5555');
+    const maskedCompressedV6 = processService.maskRawLine(compressedV6);
+    assert.ok(maskedCompressedV6.includes('[2001:0:0::]:5555'), 'compressed IPv6 masked to /48');
+    assert.ok(!maskedCompressedV6.includes('dead:beef'), 'compressed IPv6 host bits scrubbed');
+
+    const shortCompressedV6 = line.replace('1.2.3.4:5555', '[2001:db8::10]:5555');
+    assert.ok(
+        processService.maskRawLine(shortCompressedV6).includes('[2001:db8:0::]:5555'),
+        'compressed IPv6 produces a valid masked address'
+    );
+
     // Drain with ClickHouse NOT configured: batch must stay spooled (never ack
     // without a persisted write) — the at-least-once invariant.
     await processService.drainOnce();

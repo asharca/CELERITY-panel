@@ -8,13 +8,19 @@ const path = require('path');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 
-// Canonical on-node path for the Xray access log when the opt-in access-logs
-// module is enabled. The cc-agent tails exactly this file.
+// Legacy Xray file source retained for old agent/config compatibility. New
+// access-log deployments emit to stdout and read the xray systemd journal so
+// journald owns bounded rotation without racing Xray's O_APPEND file writer.
 const XRAY_ACCESS_LOG_PATH = '/var/log/xray/access.log';
+const XRAY_SYSTEMD_UNIT = 'xray';
 
-// Build the Xray `log` section. When per-node access logging is enabled we write
-// an explicit access-file path; otherwise we explicitly disable it with "none"
-// (an empty/absent value would send access lines to stdout/journald noise).
+// The official Hysteria installer registers this systemd unit. Access-log
+// collection reads its journal directly, so both the unit name and the CLI
+// logging flags are kept canonical across panel and cc-agent configuration.
+const HYSTERIA_SYSTEMD_UNIT = 'hysteria-server';
+
+// Build the Xray `log` section. An explicit empty access value selects Xray's
+// console logger (stdout -> journald); "none" disables access output.
 // The error log is deliberately NOT set: leaving it absent keeps warnings and
 // errors flowing to stdout -> journald, which admins rely on for diagnostics
 // (`journalctl -u xray`). Never silence it.
@@ -22,7 +28,7 @@ function buildXrayLogSection(node) {
     const enabled = !!(node && node.xray && node.xray.accessLogs && node.xray.accessLogs.enabled);
     return {
         loglevel: 'warning',
-        access: enabled ? XRAY_ACCESS_LOG_PATH : 'none',
+        access: enabled ? '' : 'none',
     };
 }
 
@@ -541,20 +547,39 @@ function generateNodeConfigACME(node, authUrl, domain, email, options = {}) {
 /**
  * Generate systemd service file for Hysteria
  */
-function generateSystemdService() {
+function generateSystemdService(options = {}) {
+    const accessLogsEnabled = options === true || !!options.accessLogsEnabled;
+    const loggingEnvironment = accessLogsEnabled
+        ? 'Environment=HYSTERIA_LOG_LEVEL=debug\nEnvironment=HYSTERIA_LOG_FORMAT=json\n'
+        : '';
     return `[Unit]
 Description=Hysteria 2 Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+${loggingEnvironment}ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
+`;
+}
+
+/**
+ * Build the systemd drop-in used to turn Hysteria's structured request events
+ * on without replacing the service file or its ExecStart. Hysteria officially
+ * supports both environment variables, so custom binary/config paths remain
+ * intact. An empty string means the drop-in should be removed, restoring the
+ * unit's original logging settings on the next daemon-reload/restart.
+ */
+function generateHysteriaAccessLogSystemdOverride(enabled) {
+    if (!enabled) return '';
+    return `[Service]
+Environment=HYSTERIA_LOG_LEVEL=debug
+Environment=HYSTERIA_LOG_FORMAT=json
 `;
 }
 
@@ -1682,10 +1707,13 @@ module.exports = {
     generateNodeConfig,
     generateNodeConfigACME,
     generateSystemdService,
+    generateHysteriaAccessLogSystemdOverride,
     applyOutboundsAndAcl,
     generateXrayConfig,
     buildXrayLogSection,
+    HYSTERIA_SYSTEMD_UNIT,
     XRAY_ACCESS_LOG_PATH,
+    XRAY_SYSTEMD_UNIT,
     buildXrayStreamSettings,
     generateXraySystemdService,
     applyReversePortal,

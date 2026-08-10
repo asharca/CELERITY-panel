@@ -408,6 +408,7 @@ router.post('/nodes', async (req, res) => {
         }
 
         const newNode = await HyNode.create(nodeData);
+        require('../../services/accessLogs/provisionService').scheduleReconcile();
         logger.info(`[Panel] Created ${nodeType} node ${name} (${ip})`);
         // Invalidate active-nodes, subscription, and dashboard caches so changes are reflected immediately
         await invalidateNodesCache();
@@ -597,7 +598,8 @@ router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
         // Full doc (not partial) — we .save() it below; +manualKey is select:false.
-        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey');
+        const existingNode = await HyNode.findById(nodeId)
+            .select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }
@@ -610,6 +612,23 @@ router.post('/nodes/:id', async (req, res) => {
         const previousSsh = existingNode.ssh?.toObject
             ? existingNode.ssh.toObject()
             : existingNode.ssh;
+        const previousAccessLogs = existingNode.xray?.accessLogs?.toObject
+            ? existingNode.xray.accessLogs.toObject()
+            : existingNode.xray?.accessLogs;
+        const previousAccessRuntime = {
+            _id: existingNode._id,
+            name: existingNode.name,
+            type: previousType,
+            ip: previousIp,
+            ssh: previousSsh,
+            xray: {
+                agentToken: existingNode.xray?.agentToken || '',
+                agentPort: existingNode.xray?.agentPort,
+                apiPort: existingNode.xray?.apiPort,
+                agentTls: existingNode.xray?.agentTls,
+                accessLogs: previousAccessLogs || {},
+            },
+        };
 
         const { name } = req.body;
         const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
@@ -731,6 +750,9 @@ router.post('/nodes/:id', async (req, res) => {
             previousActive,
             previousSsh,
         });
+        require('../../services/accessLogs/provisionService').scheduleReconcile({
+            previousNode: previousAccessRuntime,
+        });
 
         // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
         const sshChanged = updates['ssh.password'] !== undefined
@@ -799,6 +821,7 @@ router.post('/nodes/:id/setup', async (req, res) => {
             if (node.cascadeRole === 'bridge') updateFields.status = 'offline';
             await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields });
             await invalidateNodesCache();
+            require('../../services/accessLogs/provisionService').scheduleReconcile();
 
             if (node.type === 'xray' && node.cascadeRole !== 'bridge') {
                 const CascadeLink = require('../../models/cascadeLinkModel');

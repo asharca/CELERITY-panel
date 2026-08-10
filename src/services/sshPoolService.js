@@ -11,6 +11,7 @@
  */
 
 const { Client } = require('ssh2');
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
 
@@ -72,6 +73,17 @@ class SSHPool {
     isEnabled() {
         return this.config.enabled;
     }
+
+    connectionIdentity(node) {
+        const ssh = node?.ssh || {};
+        return crypto.createHash('sha256').update(JSON.stringify([
+            String(node?.ip || ''),
+            Number(ssh.port) || 22,
+            String(ssh.username || 'root'),
+            String(ssh.privateKey || ''),
+            String(ssh.password || ''),
+        ])).digest('hex');
+    }
     
     /**
      * Get or create connection
@@ -90,7 +102,17 @@ class SSHPool {
         }
         
         const nodeId = node._id?.toString() || node.id;
-        const existing = this.connections.get(nodeId);
+        let existing = this.connections.get(nodeId);
+        const identity = this.connectionIdentity(node);
+
+        // A node may move hosts or rotate SSH credentials while a pooled
+        // socket is alive. Never reuse that socket for the new runtime: doing
+        // so can upload teardown/config files to the wrong server and falsely
+        // "verify" credentials that were never used.
+        if (existing && existing.identity !== identity) {
+            this.removeConnection(nodeId, 'target or credential changed');
+            existing = null;
+        }
         
         // 1. Handshake in progress for this node - reuse the same promise
         //    (issue #70: prevents parallel handshakes during the race window
@@ -129,6 +151,7 @@ class SSHPool {
     createConnection(node, retryCount = 0) {
         const nodeId = node._id?.toString() || node.id;
         const nodeName = node.name || nodeId;
+        const identity = this.connectionIdentity(node);
         
         let resolveOuter;
         let rejectOuter;
@@ -170,6 +193,7 @@ class SSHPool {
             connecting: true,
             client,
             promise: outerPromise,
+            identity,
             lastUsed: Date.now(),
         });
         
@@ -186,6 +210,7 @@ class SSHPool {
                         nodeId,
                         nodeName,
                         host: node.ip,
+                        identity,
                         createdAt: Date.now(),
                         lastUsed: Date.now(),
                         useCount: 1,
@@ -469,4 +494,3 @@ class SSHPool {
 
 // Singleton (settings loaded from DB on first use)
 module.exports = new SSHPool();
-

@@ -62,7 +62,7 @@ async function offlineTests() {
     assert.ok(ddl[1].includes('access_events') && ddl[1].includes('MergeTree'), 'events is MergeTree');
     assert.ok(ddl[1].includes('INTERVAL 45 DAY'), 'retention honored');
     assert.ok(ddl[1].includes("DateTime('UTC')"), 'event_time pinned to UTC');
-    assert.ok(ddl[2].includes('MATERIALIZED VIEW') && ddl[2].includes('access_events_mv'), 'mv defined');
+    assert.ok(ddl[2].includes('MATERIALIZED VIEW') && ddl[2].includes('access_events_mv_v5'), 'current mv defined');
 
     // The regex is inlined into a ClickHouse string literal, where a lone
     // backslash is an escape character: every backslash must arrive doubled or
@@ -120,6 +120,26 @@ async function offlineTests() {
     assert.strictEqual(b.network, 'udp');
     assert.strictEqual(b.email, 'user@x');
 
+    // cc-agent normalizes HY2 journal events to this same contract. Exercise
+    // the exported production regex (rather than a copied Go equivalent) so a
+    // future ClickHouse parser change cannot silently turn HY2 rows parse_ok=0.
+    const hy2 = parseLikeMv('2026/08/10 12:34:56.123 [2001:db8::10]:4567 accepted udp:dns.example:53 [hysteria2/session-37 -> direct] email: user-42');
+    assert.strictEqual(hy2.parse_ok, 1, 'normalized HY2 line parsed');
+    assert.strictEqual(hy2.source_ip, '[2001:db8::10]');
+    assert.strictEqual(hy2.source_port, 4567);
+    assert.strictEqual(hy2.dest_host, 'dns.example');
+    assert.strictEqual(hy2.dest_port, 53);
+    assert.strictEqual(hy2.inbound_tag, 'hysteria2/session-37');
+    assert.strictEqual(hy2.outbound_tag, 'direct');
+    assert.strictEqual(hy2.email, 'user-42');
+
+    // Existing subscription account IDs may contain internal ASCII spaces.
+    // The email/userId field is the final field, so capture it greedily while
+    // still rejecting leading/trailing whitespace in the normalized contract.
+    const hy2SpacedAccount = parseLikeMv('2026/08/10 12:35:00 203.0.113.7:4567 accepted tcp:example.com:443 [hysteria2 -> direct] email: Team Alice');
+    assert.strictEqual(hy2SpacedAccount.parse_ok, 1, 'HY2 account with internal space parsed');
+    assert.strictEqual(hy2SpacedAccount.email, 'Team Alice');
+
     // Blocked line without email/route still parses.
     const c = parseLikeMv('2024/05/01 08:12:00 5.5.5.5:1000 blocked tcp:ads.example.net:80');
     assert.strictEqual(c.parse_ok, 1, 'line C parsed');
@@ -139,6 +159,37 @@ async function offlineTests() {
         path.join(__dirname, '..', 'src', 'services', 'accessLogs', 'searchService.js'), 'utf8');
     assert.ok(searchSrc.includes('toUnixTimestamp('), 'searchService emits epoch via toUnixTimestamp');
     assert.ok(!/formatDateTime\s*\(/.test(searchSrc), 'searchService must not use formatDateTime for output');
+
+    // Analytics must never count parse failures (for example, ordinary Xray
+    // warnings from an older journal-capable agent). Raw search intentionally
+    // keeps them available as diagnostics.
+    const searchService = require('../src/services/accessLogs/searchService');
+    const originalIsConfigured = clickhouse.isConfigured;
+    const originalQuery = clickhouse.query;
+    const analyticsSql = [];
+    try {
+        clickhouse.isConfigured = async () => true;
+        clickhouse.query = async sql => {
+            analyticsSql.push(sql);
+            return { ok: true, rows: [] };
+        };
+        await searchService.overview({ email: 'user-42' });
+        await searchService.userIps('user-42');
+        await searchService.ipViolators(60, 5);
+        await searchService.ipsForUser('user-42', 60, 20);
+        assert.strictEqual(analyticsSql.length, 9, 'all analytics queries captured');
+        for (const sql of analyticsSql) {
+            assert.ok(/parse_ok\s*=\s*1/.test(sql), `analytics query must filter parse failures: ${sql}`);
+        }
+
+        analyticsSql.length = 0;
+        await searchService.search({ q: 'warning' });
+        assert.strictEqual(analyticsSql.length, 1, 'raw search query captured');
+        assert.ok(!/parse_ok\s*=\s*1/.test(analyticsSql[0]), 'raw diagnostics retain parse failures');
+    } finally {
+        clickhouse.isConfigured = originalIsConfigured;
+        clickhouse.query = originalQuery;
+    }
 
     console.log('  offline: schema + regex + epoch SQL guard OK');
 }

@@ -63,6 +63,12 @@ function toUnixSeconds(d) {
     return Math.max(0, Math.floor(d.getTime() / 1000));
 }
 
+// Analytics count only structured access events. Raw search deliberately keeps
+// parse_ok=0 rows available for diagnostics and legacy-data inspection.
+function parsedEventsWhere(where) {
+    return where ? `${where} AND parse_ok = 1` : 'WHERE parse_ok = 1';
+}
+
 /**
  * Paged search returning individual events, newest first by default.
  * @returns {Promise<{degraded?:boolean, rows?:Array, error?:string}>}
@@ -113,8 +119,9 @@ async function userIps(email, filters = {}, opts = {}) {
     if (!(await clickhouse.isConfigured())) {
         return { degraded: true, rows: [] };
     }
-    const { where, params } = buildWhere({ ...filters, email: String(email || '') });
-    const andWhere = where ? 'AND' : 'WHERE';
+    const built = buildWhere({ ...filters, email: String(email || '') });
+    const where = parsedEventsWhere(built.where);
+    const params = built.params;
     const limit = Math.max(1, Math.min(500, Number(opts.limit) || 200));
 
     const sql = `
@@ -125,7 +132,7 @@ async function userIps(email, filters = {}, opts = {}) {
             toUnixTimestamp(max(event_time)) AS last_seen,
             toUnixTimestamp(min(event_time)) AS first_seen
         FROM access_events
-        ${where} ${andWhere} source_ip != ''
+        ${where} AND source_ip != ''
         GROUP BY source_ip
         ORDER BY events DESC
         LIMIT ${limit}
@@ -154,8 +161,10 @@ async function overview(filters = {}, opts = {}) {
         return { degraded: true };
     }
 
-    const { where, params } = buildWhere(filters);
-    const andWhere = where ? 'AND' : 'WHERE';
+    const built = buildWhere(filters);
+    const where = parsedEventsWhere(built.where);
+    const params = built.params;
+    const andWhere = 'AND';
     const topN = Math.max(1, Math.min(50, Number(opts.topN) || 10));
     const userN = Math.max(1, Math.min(200, Number(opts.userLimit) || 25));
 
@@ -266,7 +275,8 @@ async function ipViolators(windowMinutes, threshold, opts = {}) {
     const sql = `
         SELECT email, uniq(source_ip) AS ips
         FROM access_events
-        WHERE event_time >= now() - INTERVAL {win:UInt32} MINUTE AND email != ''
+        WHERE parse_ok = 1
+          AND event_time >= now() - INTERVAL {win:UInt32} MINUTE AND email != ''
         GROUP BY email
         HAVING ips >= {thr:UInt32}
         ORDER BY ips DESC
@@ -299,7 +309,8 @@ async function ipsForUser(email, windowMinutes, limit, opts = {}) {
     const sql = `
         SELECT DISTINCT source_ip AS ip
         FROM access_events
-        WHERE event_time >= now() - INTERVAL {win:UInt32} MINUTE
+        WHERE parse_ok = 1
+          AND event_time >= now() - INTERVAL {win:UInt32} MINUTE
           AND email = {email:String} AND source_ip != ''
         LIMIT ${cap}
     `;

@@ -4,6 +4,7 @@
 
 const { Client } = require('ssh2');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const logger = require('../utils/logger');
 const config = require('../../config');
@@ -52,6 +53,76 @@ function isSameVpsAsPanel(node) {
     }
     
     return false;
+}
+
+// Accept only an IP[/CIDR] or a conservative DNS hostname before placing a
+// panel source in root-owned firewall commands. This is defense in depth on top
+// of shell quoting: PANEL_IP is operator input and must never become shell code.
+function normalizeFirewallSource(value) {
+    let candidate = String(value || '').split(',')[0].trim();
+    if (!candidate) return '';
+
+    if (/^https?:\/\//i.test(candidate)) {
+        try {
+            candidate = new URL(candidate).hostname;
+        } catch (_) {
+            return '';
+        }
+    }
+    const bracketed = /^\[([^\]]+)\](?:\/(\d{1,3}))?$/.exec(candidate);
+    if (bracketed) candidate = bracketed[1] + (bracketed[2] ? `/${bracketed[2]}` : '');
+
+    const slash = candidate.lastIndexOf('/');
+    const host = slash === -1 ? candidate : candidate.slice(0, slash);
+    const prefixText = slash === -1 ? '' : candidate.slice(slash + 1);
+    const ipVersion = net.isIP(host);
+    if (ipVersion) {
+        if (!prefixText) return host;
+        if (!/^\d{1,3}$/.test(prefixText)) return '';
+        const prefix = Number(prefixText);
+        const maxPrefix = ipVersion === 4 ? 32 : 128;
+        return prefix <= maxPrefix ? `${host}/${prefix}` : '';
+    }
+    if (prefixText) return '';
+
+    const hostname = host.replace(/\.$/, '');
+    if (hostname.length > 253) return '';
+    const labels = hostname.split('.');
+    if (!labels.every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label))) {
+        return '';
+    }
+    return hostname;
+}
+
+function resolvePanelFirewallSource() {
+    const explicit = normalizeFirewallSource(process.env.PANEL_IP || '');
+    if (explicit) return explicit;
+    return normalizeFirewallSource(config.BASE_URL || '');
+}
+
+function shellSingleQuote(value) {
+    return "'" + String(value || '').replace(/'/g, "'\\''") + "'";
+}
+
+// cc-agent uses one canonical config/service path per host. Serialize all
+// panel-side mutations by host (not node id) so two protocol records sharing a
+// VPS cannot both observe an empty config and then overwrite each other.
+const ccAgentHostQueues = new Map();
+function ccAgentHostKey(node) {
+    const host = String(node?.ip || '').trim().replace(/^\[|\]$/g, '').toLowerCase();
+    return host || `node:${String(node?._id || node?.id || 'unknown')}`;
+}
+
+function enqueueCcAgentHostTask(node, task) {
+    const key = ccAgentHostKey(node);
+    const previous = ccAgentHostQueues.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(task);
+    ccAgentHostQueues.set(key, current);
+    const cleanup = () => {
+        if (ccAgentHostQueues.get(key) === current) ccAgentHostQueues.delete(key);
+    };
+    current.then(cleanup, cleanup);
+    return current;
 }
 
 /**
@@ -366,27 +437,73 @@ function connectSSH(node) {
     });
 }
 
-function execSSH(conn, command) {
+function execSSH(conn, command, options = {}) {
     return new Promise((resolve, reject) => {
-        conn.exec(command, (err, stream) => {
-            if (err) return reject(err);
-            
-            let stdout = '';
-            let stderr = '';
-            
-            stream.on('close', (code) => {
+        const timeoutMs = Math.max(10, Number(options.timeoutMs) || 120000);
+        const maxOutputBytes = Math.max(1024, Number(options.maxOutputBytes) || (4 * 1024 * 1024));
+        let stdout = '';
+        let stderr = '';
+        let outputBytes = 0;
+        let stream = null;
+        let settled = false;
+
+        const finish = result => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(result);
+        };
+        const failSetup = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+        };
+        const timer = setTimeout(() => {
+            const output = stdout + (stderr ? '\n[STDERR]:\n' + stderr : '');
+            finish({ success: false, output, code: null, error: `SSH command timed out after ${timeoutMs}ms` });
+            try { stream?.close(); } catch (_) { /* best effort */ }
+        }, timeoutMs);
+
+        const append = (data, isStderr) => {
+            if (settled) return;
+            const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+            outputBytes += chunk.length;
+            if (outputBytes > maxOutputBytes) {
                 const output = stdout + (stderr ? '\n[STDERR]:\n' + stderr : '');
-                
-                if (code === 0) {
-                    resolve({ success: true, output, code });
-                } else {
-                    resolve({ success: false, output, code, error: `Exit code: ${code}` });
+                finish({
+                    success: false,
+                    output,
+                    code: null,
+                    error: `SSH command output exceeded ${maxOutputBytes} bytes`,
+                });
+                try { stream?.close(); } catch (_) { /* best effort */ }
+                return;
+            }
+            if (isStderr) stderr += chunk.toString();
+            else stdout += chunk.toString();
+        };
+
+        try {
+            conn.exec(command, (err, openedStream) => {
+                if (err) return failSetup(err);
+                if (settled) {
+                    try { openedStream?.close(); } catch (_) { /* best effort */ }
+                    return;
                 }
+                stream = openedStream;
+                stream.on('close', code => {
+                    const output = stdout + (stderr ? '\n[STDERR]:\n' + stderr : '');
+                    if (code === 0) finish({ success: true, output, code });
+                    else finish({ success: false, output, code, error: `Exit code: ${code}` });
+                });
+                stream.on('data', data => append(data, false));
+                stream.stderr.on('data', data => append(data, true));
+                stream.on('error', failSetup);
             });
-            
-            stream.on('data', (data) => { stdout += data.toString(); });
-            stream.stderr.on('data', (data) => { stderr += data.toString(); });
-        });
+        } catch (error) {
+            failSetup(error);
+        }
     });
 }
 
@@ -483,18 +600,118 @@ echo "STATE:$STATE"
 `);
 }
 
-function uploadFile(conn, content, remotePath) {
+function uploadFile(conn, content, remotePath, options = {}) {
     return new Promise((resolve, reject) => {
+        const timeoutMs = Math.max(10, Number(options.timeoutMs) || 60000);
+        let settled = false;
+        let writeStream = null;
+        const finish = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (error) reject(error);
+            else resolve();
+        };
+        const timer = setTimeout(() => {
+            try { writeStream?.destroy(); } catch (_) { /* best effort */ }
+            finish(new Error(`SFTP upload timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
         conn.sftp((err, sftp) => {
-            if (err) return reject(err);
+            if (err) return finish(err);
+            if (settled) return;
             
-            const writeStream = sftp.createWriteStream(remotePath);
-            writeStream.on('close', () => resolve());
-            writeStream.on('error', (err) => reject(err));
+            writeStream = sftp.createWriteStream(remotePath);
+            writeStream.on('close', () => finish());
+            writeStream.on('error', finish);
             writeStream.write(content);
             writeStream.end();
         });
     });
+}
+
+// Read a small remote file without sending its contents through a shell or
+// command output. This is used for ownership checks on credential-bearing
+// config files, so their tokens never appear in logs.
+function readRemoteFileIfExists(conn, remotePath, maxBytes = 1024 * 1024, options = {}) {
+    return new Promise((resolve, reject) => {
+        const timeoutMs = Math.max(10, Number(options.timeoutMs) || 30000);
+        let settled = false;
+        let readStream = null;
+        const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (error) reject(error);
+            else resolve(value);
+        };
+        const timer = setTimeout(() => {
+            try { readStream?.destroy(); } catch (_) { /* best effort */ }
+            finish(new Error(`SFTP read timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        conn.sftp((sftpError, sftp) => {
+            if (sftpError) return finish(sftpError);
+            if (settled) return;
+            sftp.stat(remotePath, (statError, stats) => {
+                if (statError) {
+                    if (statError.code === 2 || /no such file/i.test(statError.message || '')) {
+                        return finish(null, null);
+                    }
+                    return finish(statError);
+                }
+                if (!stats || stats.size > maxBytes) {
+                    return finish(new Error(`Remote file ${remotePath} exceeds the safety limit`));
+                }
+
+                const chunks = [];
+                let total = 0;
+                readStream = sftp.createReadStream(remotePath);
+                readStream.on('data', chunk => {
+                    total += chunk.length;
+                    if (total > maxBytes) {
+                        readStream.destroy(new Error(`Remote file ${remotePath} exceeds the safety limit`));
+                        return;
+                    }
+                    chunks.push(Buffer.from(chunk));
+                });
+                readStream.on('end', () => finish(null, Buffer.concat(chunks).toString('utf8')));
+                readStream.on('error', finish);
+            });
+        });
+    });
+}
+
+// A host has one canonical cc-agent service/config path. Refuse to overwrite a
+// config carrying another node's token: otherwise enabling HY2 logs on a host
+// that also runs an Xray agent would silently switch that agent into
+// Hysteria-only mode and break Xray sync/stats.
+function assertCcAgentConfigContentOwnership(content, expectedToken) {
+    if (content === null) return;
+
+    let current;
+    try {
+        current = JSON.parse(content);
+    } catch (_) {
+        throw new Error('Existing cc-agent config is not valid JSON; refusing to overwrite it');
+    }
+    if (!current.token || current.token !== expectedToken) {
+        throw new Error('Existing cc-agent config belongs to another node or proxy service; shared-host collection requires a separate agent instance');
+    }
+}
+
+async function assertCcAgentConfigOwnership(conn, expectedToken) {
+    const content = await readRemoteFileIfExists(conn, '/etc/cc-agent/config.json');
+    assertCcAgentConfigContentOwnership(content, expectedToken);
+}
+
+async function assertNodeSshCcAgentConfigOwnership(ssh, expectedToken) {
+    let content;
+    try {
+        content = await ssh.readFile('/etc/cc-agent/config.json');
+    } catch (error) {
+        if (error?.code === 2 || /no such file/i.test(error?.message || '')) return;
+        throw error;
+    }
+    assertCcAgentConfigContentOwnership(content, expectedToken);
 }
 
 /**
@@ -1254,16 +1471,38 @@ function generateAgentToken() {
     return require('crypto').randomBytes(32).toString('hex');
 }
 
+// cc-agent uses Go's log package, so release builds may print a timestamp and
+// either `cc-agent 1.5.0` or the historical `cc-agent v1.5.0` spelling.
+function parseAgentVersion(output) {
+    const match = String(output || '').match(/cc-agent[:\s]+v?(\d+\.\d+\.\d+)(?:[-+][^\s]+)?/i);
+    return match?.[1] || '';
+}
+
+function isAgentVersionAtLeast(version, minimum) {
+    const parse = value => {
+        const match = String(value || '').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+        return match ? match.slice(1).map(Number) : null;
+    };
+    const current = parse(version);
+    const required = parse(minimum);
+    if (!current || !required) return false;
+    for (let i = 0; i < 3; i++) {
+        if (current[i] > required[i]) return true;
+        if (current[i] < required[i]) return false;
+    }
+    return true;
+}
+
 /**
- * Ensure the Xray node has a persisted agent token in MongoDB.
+ * Ensure a physical proxy node has a persisted agent token in MongoDB.
  * MongoDB remains the source of truth; the installer only consumes the saved token.
  *
  * @param {Object} node - Node document
  * @returns {{ node: Object, token: string, created: boolean }}
  */
-async function ensureXrayAgentToken(node) {
-    if (node.type !== 'xray') {
-        throw new Error(`Node ${node.name} is not an Xray node`);
+async function ensureNodeAgentToken(node) {
+    if (!['xray', 'hysteria'].includes(node.type)) {
+        throw new Error(`Node ${node.name} cannot run cc-agent`);
     }
 
     const existingToken = (node.xray || {}).agentToken;
@@ -1300,8 +1539,16 @@ async function ensureXrayAgentToken(node) {
     };
 }
 
+// Backward-compatible Xray-only wrapper used by the existing node setup flow.
+async function ensureXrayAgentToken(node) {
+    if (node.type !== 'xray') {
+        throw new Error(`Node ${node.name} is not an Xray node`);
+    }
+    return ensureNodeAgentToken(node);
+}
+
 /**
- * Install and configure cc-agent on an Xray node via SSH.
+ * Install and configure cc-agent on a physical proxy node via SSH.
  *
  * Flow:
  *  1. Download binary from GitHub releases (or fallback URL)
@@ -1318,15 +1565,23 @@ async function ensureXrayAgentToken(node) {
  * @param {Function} log - Logging callback
  * @returns {{ success, agentVersion }}
  */
-async function installCCAgent(conn, node, token, panelSource, sameVps, log) {
-    const agentPort = (node.xray || {}).agentPort || 62080;
+async function installCCAgent(conn, node, token, panelSource, sameVps, log, accessLogs) {
+    await assertCcAgentConfigOwnership(conn, token);
+    const requestedAgentPort = Number((node.xray || {}).agentPort);
+    const agentPort = Number.isInteger(requestedAgentPort) && requestedAgentPort > 0 && requestedAgentPort <= 65535
+        ? requestedAgentPort : 62080;
     const useTls = (node.xray || {}).agentTls !== false;
-    const apiPort = (node.xray || {}).apiPort || 61000;
+    const requestedApiPort = Number((node.xray || {}).apiPort);
+    const apiPort = Number.isInteger(requestedApiPort) && requestedApiPort > 0 && requestedApiPort <= 65535
+        ? requestedApiPort : 61000;
 
-    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls);
+    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs);
     const configJson = JSON.stringify(agentConfig, null, 2);
 
-    // Build firewall rules based on setup type
+    // Build firewall rules based on setup type. Normalize again here so direct
+    // callers cannot bypass the root-command input boundary.
+    const safePanelSource = normalizeFirewallSource(panelSource);
+    const quotedPanelSource = shellSingleQuote(safePanelSource);
     let firewallRules = '';
     if (sameVps) {
         firewallRules = `
@@ -1343,15 +1598,15 @@ if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: acti
     ufw allow from 192.168.0.0/16 to any port ${agentPort} proto tcp 2>/dev/null || true
     echo "Done: ufw rules added"
 fi`;
-    } else if (panelSource) {
+    } else if (safePanelSource) {
         firewallRules = `
-echo "Remote setup: allowing panel source ${panelSource}"
+echo "Remote setup: allowing panel source" ${quotedPanelSource}
 if command -v iptables &> /dev/null; then
-    iptables -I INPUT -p tcp -s ${panelSource} --dport ${agentPort} -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p tcp -s ${quotedPanelSource} --dport ${agentPort} -j ACCEPT 2>/dev/null || true
     echo "Done: iptables rule added"
 fi
 if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow from ${panelSource} to any port ${agentPort} proto tcp 2>/dev/null || true
+    ufw allow from ${quotedPanelSource} to any port ${agentPort} proto tcp 2>/dev/null || true
     echo "Done: ufw rule added"
 fi`;
     } else {
@@ -1366,7 +1621,6 @@ fi`;
     // Step 1: Download binary
     log('Downloading cc-agent binary...');
     const downloadResult = await execSSH(conn, `
-rm -f /usr/local/bin/cc-agent
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     BIN="cc-agent-linux-arm64"
@@ -1374,13 +1628,18 @@ else
     BIN="cc-agent-linux-amd64"
 fi
 URL="https://github.com/ClickDevTech/CELERITY-panel/releases/latest/download/$BIN"
+TMP="/usr/local/bin/.cc-agent-download-$$"
+trap 'rm -f "$TMP"' EXIT
 echo "Downloading $URL ..."
-curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent
-if [ ! -s /usr/local/bin/cc-agent ]; then
+curl -fsSL --max-time 120 "$URL" -o "$TMP"
+if [ ! -s "$TMP" ]; then
     echo "ERROR: Download failed or file is empty"
     exit 1
 fi
-chmod +x /usr/local/bin/cc-agent
+chmod +x "$TMP"
+"$TMP" -version 2>&1 || { echo "ERROR: Downloaded cc-agent cannot execute"; exit 1; }
+mv -f "$TMP" /usr/local/bin/cc-agent || exit 1
+trap - EXIT
 echo "OK: cc-agent binary ready"
 ls -la /usr/local/bin/cc-agent
 `);
@@ -1393,15 +1652,21 @@ ls -la /usr/local/bin/cc-agent
 
     // Step 2: Write config
     log('Writing agent config...');
-    await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+    const configDirsResult = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+    if (!configDirsResult.success) {
+        return { success: false, agentVersion: '', output: configDirsResult.output || configDirsResult.error };
+    }
     await uploadFile(conn, configJson, '/etc/cc-agent/config.json');
-    await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+    const configModeResult = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+    if (!configModeResult.success) {
+        return { success: false, agentVersion: '', output: configModeResult.output || configModeResult.error };
+    }
     log('Config written');
 
     // Step 3: Generate TLS cert if needed
     if (useTls) {
         log('Generating TLS certificate...');
-        await execSSH(conn, `
+        const tlsResult = await execSSH(conn, `
 openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout /etc/cc-agent/key.pem \
     -out /etc/cc-agent/cert.pem \
@@ -1409,14 +1674,20 @@ openssl req -x509 -nodes -newkey rsa:2048 \
 chmod 600 /etc/cc-agent/key.pem /etc/cc-agent/cert.pem
 echo "OK: TLS cert generated"
 `);
+        if (!tlsResult.success) {
+            return { success: false, agentVersion: '', output: tlsResult.output || tlsResult.error };
+        }
         log('TLS certificate ready');
     }
 
     // Step 4: Install systemd service
     log('Installing systemd service...');
+    const hysteriaUnit = ['hysteria-server', 'hysteria'].includes(accessLogs?.journalUnit)
+        ? accessLogs.journalUnit : 'hysteria-server';
+    const proxyService = node.type === 'hysteria' ? `${hysteriaUnit}.service` : 'xray.service';
     const serviceUnit = `[Unit]
-Description=CC Xray Agent
-After=network.target xray.service
+Description=CC Proxy Agent
+After=network.target ${proxyService}
 
 [Service]
 Type=simple
@@ -1442,7 +1713,7 @@ systemctl restart cc-agent
 sleep 2
 if systemctl is-active cc-agent > /dev/null 2>&1; then
     echo "OK: cc-agent running"
-    /usr/local/bin/cc-agent -version 2>/dev/null || true
+    /usr/local/bin/cc-agent -version 2>&1 || true
 else
     echo "ERROR: cc-agent failed to start"
     journalctl -u cc-agent -n 10 --no-pager 2>/dev/null || true
@@ -1450,7 +1721,7 @@ fi
 `);
 
     const allOutput = [downloadResult.output, startResult.output].join('\n');
-    const agentVersion = allOutput.match(/cc-agent[:\s]+(v[\d.]+)/)?.[1] || 'installed';
+    const agentVersion = parseAgentVersion(allOutput) || 'installed';
     const isRunning = startResult.output.includes('OK: cc-agent running');
 
     return { success: isRunning, agentVersion, output: allOutput };
@@ -1497,15 +1768,17 @@ async function setupXrayNodeWithAgent(node, options = {}) {
 
         // Same-VPS setups must allow Docker bridge traffic to reach the host agent.
         const sameVps = isSameVpsAsPanel(preparedNode);
-        const panelSourceRaw = process.env.PANEL_IP || config.BASE_URL || '';
-        const panelSource = panelSourceRaw.replace(/^https?:\/\//, '').split(':')[0].split('/')[0];
+        const panelSource = resolvePanelFirewallSource();
         log(`Agent firewall mode: ${sameVps ? 'same-vps' : 'remote'}`);
         if (!sameVps) {
             log(`Panel source for firewall: ${panelSource || 'not provided'}`);
         }
 
         log('Installing CC Agent...');
-        const agentResult = await installCCAgent(conn, preparedNode, agentToken, panelSource, sameVps, log);
+        const agentResult = await enqueueCcAgentHostTask(
+            preparedNode,
+            () => installCCAgent(conn, preparedNode, agentToken, panelSource, sameVps, log)
+        );
         if (agentResult.output) {
             result.logs.push(agentResult.output);
         }
@@ -1595,7 +1868,13 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
     if (accessLogs && typeof accessLogs === 'object') {
         cfg.access_logs = {
             enabled: !!accessLogs.enabled,
-            path: accessLogs.path || '/var/log/xray/access.log',
+            // Source/format are understood by journal-capable agents. The
+            // access-log provisioner gates both Xray and HY2 on cc-agent 1.5.1+
+            // before it can enable this block.
+            source: accessLogs.source || 'file',
+            format: accessLogs.format || 'xray',
+            journal_unit: accessLogs.journalUnit || '',
+            path: accessLogs.path !== undefined ? accessLogs.path : '/var/log/xray/access.log',
             ingest_url: accessLogs.ingestUrl || '',
             ingest_token: accessLogs.ingestToken || '',
             insecure_tls: !!accessLogs.insecureTls,
@@ -1621,7 +1900,7 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
  * @param {Object} node - Node document with xray.agentToken/agentPort/...
  * @param {NodeSSH} ssh - Already-connected NodeSSH wrapper from syncService
  */
-async function reloadCcAgent(node, ssh) {
+async function reloadCcAgentUnlocked(node, ssh) {
     const xray = node.xray || {};
     const token = xray.agentToken;
     if (!token) {
@@ -1630,16 +1909,13 @@ async function reloadCcAgent(node, ssh) {
     const agentPort = xray.agentPort || 62080;
     const apiPort = xray.apiPort || 61000;
     const useTls = xray.agentTls !== false;
+    await assertNodeSshCcAgentConfigOwnership(ssh, token);
 
-    // Resolve the access-log block for this node (best-effort). When the module
-    // is disabled or the credential is missing we still write an explicit
-    // disabled block so a previously-enabled agent is turned off cleanly.
-    let accessLogs;
-    try {
-        accessLogs = await require('./accessLogs/provisionService').buildNodeAccessLogsConfig(node);
-    } catch (e) {
-        accessLogs = { enabled: false };
-    }
+    // Resolve the access-log block before touching the remote config. A DB or
+    // decryption error must propagate: replacing a known-good enabled config
+    // with `{enabled:false}` would silently stop collection while the panel
+    // continued reporting the old fingerprint as active.
+    const accessLogs = await require('./accessLogs/provisionService').buildNodeAccessLogsConfig(node);
 
     const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs);
     const configJson = JSON.stringify(agentConfig, null, 2);
@@ -1659,9 +1935,542 @@ async function reloadCcAgent(node, ssh) {
         + 'exit 1'
     );
     if (waitResult && typeof waitResult.code === 'number' && waitResult.code !== 0) {
-        logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active within ~5s (will continue anyway)`);
+        throw new Error(`cc-agent did not become active after restart (exit ${waitResult.code})`);
     }
     logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
+}
+
+function reloadCcAgent(node, ssh) {
+    return enqueueCcAgentHostTask(node, () => reloadCcAgentUnlocked(node, ssh));
+}
+
+const HYSTERIA_ACCESS_LOG_OVERRIDE_PATH =
+    '/etc/systemd/system/hysteria-server.service.d/20-celerity-access-logs.conf';
+const HYSTERIA_ACCESS_LOG_OVERRIDE_FILE = '20-celerity-access-logs.conf';
+
+function hysteriaAccessLogOverridePath(unit) {
+    if (!['hysteria-server', 'hysteria'].includes(unit)) {
+        throw new Error(`Unsupported Hysteria systemd unit: ${unit}`);
+    }
+    return `/etc/systemd/system/${unit}.service.d/${HYSTERIA_ACCESS_LOG_OVERRIDE_FILE}`;
+}
+
+async function inspectHysteriaSystemdUnits(conn) {
+    const states = [];
+    for (const unit of ['hysteria-server', 'hysteria']) {
+        const [existsResult, activeResult] = await Promise.all([
+            execSSH(conn, `systemctl cat ${unit}.service >/dev/null 2>&1`),
+            execSSH(conn, `systemctl is-active ${unit}.service >/dev/null 2>&1`),
+        ]);
+        states.push({ unit, exists: !!existsResult.success, active: !!activeResult.success });
+    }
+    return states;
+}
+
+async function detectHysteriaSystemdUnit(conn, preferred = '') {
+    const candidates = preferred === 'hysteria'
+        ? ['hysteria', 'hysteria-server']
+        : ['hysteria-server', 'hysteria'];
+    const states = await inspectHysteriaSystemdUnits(conn);
+    const active = states.filter(state => state.active).map(state => state.unit);
+    if (active.length > 1) {
+        throw new Error('Both hysteria-server.service and hysteria.service are active; refusing ambiguous journal collection');
+    }
+    if (active.length === 1) return active[0];
+
+    for (const unit of candidates) {
+        if (states.some(state => state.unit === unit && state.exists)) return unit;
+    }
+    throw new Error('Neither hysteria-server.service nor hysteria.service exists');
+}
+
+function assertHysteriaExecStartLoggingCompatible(execStart) {
+    const command = String(execStart || '');
+    const readFlag = (longName, shortName) => {
+        const pattern = new RegExp(
+            `(?:^|\\s)(?:--${longName}(?:=|\\s+)([^\\s;]+)|-${shortName}(?:=([^\\s;]+)|([^\\s;=]+)|\\s+([^\\s;]+)))`,
+            'gi'
+        );
+        let match;
+        let value = '';
+        // Cobra/pflag uses the last repeated value. Validate the same effective
+        // value so an earlier safe flag cannot hide a later override. Short
+        // flags also accept the compact pflag form (for example, -linfo).
+        while ((match = pattern.exec(command)) !== null) {
+            const rawValue = match.slice(1).find(candidate => candidate !== undefined) || '';
+            value = rawValue.replace(/^['"]|['"]$/g, '').toLowerCase();
+        }
+        return value;
+    };
+    const level = readFlag('log-level', 'l');
+    const format = readFlag('log-format', 'f');
+    if (level && level !== 'debug') {
+        throw new Error(`Hysteria ExecStart overrides log level with ${level}; debug is required`);
+    }
+    if (format && format !== 'json') {
+        throw new Error(`Hysteria ExecStart overrides log format with ${format}; json is required`);
+    }
+}
+
+function assertHysteriaEffectiveLoggingEnvironment(environment) {
+    const text = String(environment || '');
+    let entries;
+
+    if (text.includes('\0')) {
+        // /proc/<pid>/environ: NUL-delimited, with arbitrary whitespace in a
+        // value. Treat every record as one assignment so a value containing
+        // " HYSTERIA_LOG_LEVEL=debug" cannot masquerade as another variable.
+        entries = text.split('\0');
+    } else {
+        // systemctl show Environment emits shell-style, whitespace-separated
+        // assignments and quotes values containing spaces. Parse just enough
+        // shell quoting/escaping to recover exact assignment tokens; never
+        // search for a key inside another variable's value.
+        entries = [];
+        let token = '';
+        let quote = '';
+        let escaped = false;
+        const push = () => {
+            if (token) entries.push(token);
+            token = '';
+        };
+        for (const character of text) {
+            if (escaped) {
+                token += character;
+                escaped = false;
+            } else if (character === '\\' && quote !== "'") {
+                escaped = true;
+            } else if (quote) {
+                if (character === quote) quote = '';
+                else token += character;
+            } else if (character === '"' || character === "'") {
+                quote = character;
+            } else if (/\s/.test(character)) {
+                push();
+            } else {
+                token += character;
+            }
+        }
+        if (escaped) token += '\\';
+        push();
+    }
+
+    const values = new Map();
+    for (const rawEntry of entries) {
+        const entry = String(rawEntry || '');
+        const separator = entry.indexOf('=');
+        if (separator <= 0) continue;
+        const name = entry.slice(0, separator);
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+        values.set(name, entry.slice(separator + 1));
+    }
+    const level = String(values.get('HYSTERIA_LOG_LEVEL') || '').toLowerCase();
+    const format = String(values.get('HYSTERIA_LOG_FORMAT') || '').toLowerCase();
+    if (level !== 'debug' || format !== 'json') {
+        throw new Error(`effective Hysteria logging environment must be debug/json (got ${level || 'unset'}/${format || 'unset'})`);
+    }
+}
+
+async function waitForAgentAccessLogSourceReady(conn, options = {}) {
+    const agentPort = Number(options.agentPort) || 62080;
+    const protocol = options.useTls === false ? 'http' : 'https';
+    const token = String(options.token || '');
+    const attempts = Math.max(1, options.attempts === undefined ? 20 : Number(options.attempts));
+    const delayMs = Math.max(0, options.delayMs === undefined ? 250 : Number(options.delayMs));
+    const run = options.execCommand || execSSH;
+    const expected = options.accessLogs || {};
+    const authHeader = shellSingleQuote(`Authorization: Bearer ${token}`);
+    const url = shellSingleQuote(`${protocol}://127.0.0.1:${agentPort}/info`);
+    let lastError = 'source is not ready';
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        const result = await run(
+            conn,
+            `curl --silent --show-error --fail --insecure --noproxy '*' --max-time 3 --header ${authHeader} ${url}`
+        );
+        if (result?.success) {
+            try {
+                const info = JSON.parse(String(result.output || '').trim());
+                const status = info?.access_logs || {};
+                const matches = status.enabled === true
+                    && status.source === expected.source
+                    && status.format === expected.format
+                    && status.journal_unit === expected.journalUnit;
+                if (matches && status.source_ready === true && !status.source_error) {
+                    return status;
+                }
+                lastError = status.source_error
+                    || `source status is enabled=${status.enabled === true}, ready=${status.source_ready === true}`;
+            } catch (error) {
+                lastError = `invalid cc-agent /info response: ${error.message}`;
+            }
+        } else {
+            lastError = result?.output || result?.error || 'cc-agent /info request failed';
+        }
+        if (attempt + 1 < attempts && delayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
+    throw new Error(`cc-agent access-log source not ready: ${lastError}`);
+}
+
+function hasStructuredHysteriaStartupLog(output) {
+    return String(output || '').split('\n').some(line => {
+        try {
+            const event = JSON.parse(line.trim());
+            return event && typeof event === 'object'
+                && typeof event.msg === 'string'
+                && event.msg.length > 0;
+        } catch (_) {
+            return false;
+        }
+    });
+}
+
+async function removeHysteriaAccessLogOverride(conn, unit) {
+    const overridePath = hysteriaAccessLogOverridePath(unit);
+    const overrideDir = `/etc/systemd/system/${unit}.service.d`;
+    const result = await execSSH(conn, `if [ -e ${overridePath} ] || [ -L ${overridePath} ]; then
+    rm -f ${overridePath} || exit 1
+fi
+rmdir ${overrideDir} 2>/dev/null || true`);
+    if (!result.success) {
+        throw new Error(`cannot remove ${unit} logging drop-in: ${result.output || result.error}`);
+    }
+}
+
+async function disableHysteriaAccessLogsRuntime(
+    conn,
+    preparedNode,
+    token,
+    accessLogs,
+    manageAgent,
+    log
+) {
+    const states = await inspectHysteriaSystemdUnits(conn);
+    const preferred = ['hysteria-server', 'hysteria'].includes(accessLogs?.journalUnit)
+        ? accessLogs.journalUnit : '';
+    const selected = states.find(state => state.unit === preferred && state.exists)
+        || states.find(state => state.active)
+        || states.find(state => state.exists);
+    const journalUnit = selected?.unit || preferred || 'hysteria-server';
+    const errors = [];
+
+    // Privacy first: stop future debug request events even when the agent is
+    // missing/broken. Every cleanup action is attempted independently.
+    for (const unit of ['hysteria-server', 'hysteria']) {
+        try {
+            await removeHysteriaAccessLogOverride(conn, unit);
+        } catch (error) {
+            errors.push(error.message);
+        }
+    }
+    const reload = await execSSH(conn, 'systemctl daemon-reload');
+    if (!reload.success) errors.push(`systemd daemon-reload failed: ${reload.output || reload.error}`);
+
+    for (const state of states.filter(item => item.active)) {
+        const restart = await execSSH(conn, `systemctl restart ${state.unit} && systemctl is-active ${state.unit} >/dev/null 2>&1`);
+        if (!restart.success) {
+            errors.push(`cannot restart ${state.unit}: ${restart.output || restart.error}`);
+        }
+    }
+    if (!states.some(state => state.exists)) {
+        errors.push('Neither hysteria-server.service nor hysteria.service exists');
+    }
+
+    if (manageAgent) {
+        try {
+            const xray = preparedNode.xray || {};
+            const agentConfig = buildAgentConfig(
+                preparedNode,
+                token,
+                xray.agentPort || 62080,
+                xray.apiPort || 61000,
+                xray.agentTls !== false,
+                {
+                    ...accessLogs,
+                    enabled: false,
+                    journalUnit,
+                    ingestUrl: '',
+                    ingestToken: '',
+                }
+            );
+            const mkdir = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+            if (!mkdir.success) throw new Error(mkdir.output || mkdir.error || 'cannot prepare cc-agent directories');
+            await uploadFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json');
+            const mode = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+            if (!mode.success) throw new Error(mode.output || mode.error || 'cannot protect cc-agent config');
+            const restart = await execSSH(
+                conn,
+                'systemctl restart cc-agent && systemctl is-active cc-agent >/dev/null 2>&1'
+            );
+            if (!restart.success) throw new Error(restart.output || restart.error || 'cc-agent restart failed');
+        } catch (error) {
+            errors.push(`cannot disable cc-agent shipper: ${error.message}`);
+        }
+    }
+
+    if (errors.length > 0) {
+        throw new Error(`Hysteria access-log disable incomplete: ${errors.join('; ')}`);
+    }
+    log('disabled Hysteria JSON journal shipping');
+    return { success: true, agentVersion: preparedNode.agentVersion || '', journalUnit };
+}
+
+/**
+ * Reconcile Hysteria's structured journald source and the cc-agent shipper.
+ * Existing HY2 nodes did not historically have an agent, so the first enable
+ * can install/upgrade it over the same SSH connection. The Hysteria YAML is
+ * deliberately untouched; only a reversible systemd drop-in controls logging.
+ */
+async function reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options = {}) {
+    if (node?.type !== 'hysteria') {
+        throw new Error('Hysteria access-log reconcile requires a hysteria node');
+    }
+    if (!node.ssh?.password && !node.ssh?.privateKey) {
+        throw new Error('SSH credentials are required to configure Hysteria access logs');
+    }
+
+    const ensured = await ensureNodeAgentToken(node);
+    const preparedNode = ensured.node;
+    const token = ensured.token;
+    const xray = preparedNode.xray || {};
+    const agentPort = xray.agentPort || 62080;
+    const apiPort = xray.apiPort || 61000;
+    const useTls = xray.agentTls !== false;
+    const enabled = !!accessLogs?.enabled;
+    const log = message => logger.info(`[AccessLogs] Node ${preparedNode.name}: ${message}`);
+
+    let conn;
+    let agentVersion = preparedNode.agentVersion || '';
+    let journalUnit = '';
+    let effectiveAccessLogs = null;
+    let manageAgent = true;
+    let runtimeMutated = false;
+    try {
+        conn = await connectSSH(preparedNode);
+        try {
+            await assertCcAgentConfigOwnership(conn, token);
+        } catch (ownershipError) {
+            if (enabled) throw ownershipError;
+            // Disabling must still remove HY2 debug logging even if another
+            // proxy now owns the host's singleton cc-agent. Leave that agent's
+            // config/service untouched and clean only the Hysteria drop-in.
+            manageAgent = false;
+            log(`leaving shared cc-agent untouched during disable: ${ownershipError.message}`);
+        }
+        if (!enabled) {
+            return await disableHysteriaAccessLogsRuntime(
+                conn,
+                preparedNode,
+                token,
+                accessLogs,
+                manageAgent,
+                log
+            );
+        }
+        journalUnit = await detectHysteriaSystemdUnit(conn, accessLogs?.journalUnit);
+        effectiveAccessLogs = { ...accessLogs, journalUnit };
+
+        if (enabled) {
+            const execStartResult = await execSSH(
+                conn,
+                `systemctl show ${journalUnit}.service --property=ExecStart --value`
+            );
+            if (!execStartResult.success) {
+                throw new Error(`cannot inspect Hysteria ExecStart: ${execStartResult.output || execStartResult.error}`);
+            }
+            assertHysteriaExecStartLoggingCompatible(execStartResult.output);
+        }
+
+        if (manageAgent && options.installAgent) {
+            runtimeMutated = true;
+            const sameVps = isSameVpsAsPanel(preparedNode);
+            const panelSource = resolvePanelFirewallSource();
+            const installed = await installCCAgent(
+                conn,
+                preparedNode,
+                token,
+                panelSource,
+                sameVps,
+                log,
+                effectiveAccessLogs
+            );
+            if (!installed.success) {
+                throw new Error(`cc-agent installation failed: ${installed.output || 'unknown error'}`);
+            }
+            agentVersion = installed.agentVersion;
+            if (options.minimumAgentVersion
+                && !isAgentVersionAtLeast(agentVersion, options.minimumAgentVersion)) {
+                throw new Error(`cc-agent ${options.minimumAgentVersion}+ required; downloaded ${agentVersion || 'unknown'}`);
+            }
+        } else if (manageAgent) {
+            runtimeMutated = true;
+            const agentConfig = buildAgentConfig(
+                preparedNode,
+                token,
+                agentPort,
+                apiPort,
+                useTls,
+                effectiveAccessLogs
+            );
+            const mkdirResult = await execSSH(conn, 'mkdir -p /etc/cc-agent /var/lib/cc-agent');
+            if (!mkdirResult.success) {
+                throw new Error(`cannot prepare cc-agent directories: ${mkdirResult.output || mkdirResult.error}`);
+            }
+            await uploadFile(conn, JSON.stringify(agentConfig, null, 2), '/etc/cc-agent/config.json');
+            const chmodResult = await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+            if (!chmodResult.success) {
+                throw new Error(`cannot protect cc-agent config: ${chmodResult.output || chmodResult.error}`);
+            }
+        }
+
+        const override = configGenerator.generateHysteriaAccessLogSystemdOverride(enabled);
+        const overridePath = hysteriaAccessLogOverridePath(journalUnit);
+        const overrideDir = `/etc/systemd/system/${journalUnit}.service.d`;
+        runtimeMutated = true;
+        if (override) {
+            const alternateUnit = journalUnit === 'hysteria-server' ? 'hysteria' : 'hysteria-server';
+            await removeHysteriaAccessLogOverride(conn, alternateUnit);
+            const mkdirResult = await execSSH(conn, `mkdir -p ${overrideDir}`);
+            if (!mkdirResult.success) {
+                throw new Error(`cannot create Hysteria drop-in directory: ${mkdirResult.output || mkdirResult.error}`);
+            }
+            await uploadFile(conn, override, overridePath);
+        } else {
+            for (const unit of ['hysteria-server', 'hysteria']) {
+                await removeHysteriaAccessLogOverride(conn, unit);
+            }
+        }
+
+        const daemonReloadResult = await execSSH(conn, 'systemctl daemon-reload');
+        if (!daemonReloadResult.success) {
+            throw new Error(`systemd daemon-reload failed: ${daemonReloadResult.output || daemonReloadResult.error}`);
+        }
+        const effectiveEnvironment = await execSSH(
+            conn,
+            `systemctl show ${journalUnit}.service --property=Environment --value`
+        );
+        if (!effectiveEnvironment.success) {
+            throw new Error(`cannot inspect Hysteria environment: ${effectiveEnvironment.output || effectiveEnvironment.error}`);
+        }
+        assertHysteriaEffectiveLoggingEnvironment(effectiveEnvironment.output);
+
+        if (manageAgent) {
+            const agentRestartResult = await execSSH(
+                conn,
+                'systemctl restart cc-agent && systemctl is-active cc-agent >/dev/null 2>&1'
+            );
+            if (!agentRestartResult.success) {
+                throw new Error(`cc-agent restart failed: ${agentRestartResult.output || agentRestartResult.error}`);
+            }
+            await waitForAgentAccessLogSourceReady(conn, {
+                agentPort,
+                useTls,
+                token,
+                accessLogs: effectiveAccessLogs,
+            });
+        }
+
+        const remoteClockResult = await execSSH(conn, 'date +%s');
+        const remoteEpoch = Number.parseInt(remoteClockResult.output, 10);
+        if (!remoteClockResult.success || !Number.isFinite(remoteEpoch)) {
+            throw new Error(`cannot read node clock before Hysteria restart: ${remoteClockResult.output || remoteClockResult.error}`);
+        }
+
+        const restartResult = await execSSH(conn, `
+systemctl restart ${journalUnit} || exit 1
+for i in 1 2 3 4 5; do
+    systemctl is-active ${journalUnit} >/dev/null 2>&1 && break
+    sleep 1
+done
+systemctl is-active ${journalUnit} >/dev/null 2>&1 || exit 1
+`);
+        if (!restartResult.success) {
+            throw new Error(`service restart failed: ${restartResult.output || restartResult.error}`);
+        }
+
+        if (enabled) {
+            // systemctl show Environment does not include every EnvironmentFile,
+            // UnsetEnvironment or `/usr/bin/env KEY=value` override. Validate
+            // the environment of the process that is actually running so debug
+            // request events cannot be silently suppressed by a later drop-in.
+            const processEnvironment = await execSSH(conn, `
+PID="$(systemctl show ${journalUnit}.service --property=MainPID --value)"
+case "$PID" in ''|0|*[!0-9]*) exit 1 ;; esac
+EXECUTABLE="$(readlink -f "/proc/$PID/exe")" || exit 1
+EXPECTED_EXECUTABLE="$(systemctl show ${journalUnit}.service --property=ExecStart --value | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p' | head -n 1)"
+[ -n "$EXPECTED_EXECUTABLE" ] || { echo "Cannot resolve Hysteria ExecStart path" >&2; exit 2; }
+EXPECTED_EXECUTABLE="$(readlink -f "$EXPECTED_EXECUTABLE")" || exit 2
+[ "$EXECUTABLE" = "$EXPECTED_EXECUTABLE" ] || {
+    echo "MainPID executable does not match ExecStart: $EXECUTABLE != $EXPECTED_EXECUTABLE" >&2
+    exit 2
+}
+case "$(basename "$EXECUTABLE")" in
+    hysteria|hy2) ;;
+    *) echo "MainPID does not run Hysteria directly: $EXECUTABLE" >&2; exit 2 ;;
+esac
+cat "/proc/$PID/environ"
+`);
+            if (!processEnvironment.success) {
+                throw new Error(`cannot inspect running Hysteria environment: ${processEnvironment.output || processEnvironment.error}`);
+            }
+            assertHysteriaEffectiveLoggingEnvironment(processEnvironment.output);
+
+            const journalResult = await execSSH(
+                conn,
+                `journalctl --unit=${journalUnit} --since=@${remoteEpoch} --lines=100 --output=cat --no-pager`
+            );
+            if (!journalResult.success || !hasStructuredHysteriaStartupLog(journalResult.output)) {
+                throw new Error('Hysteria did not emit structured JSON logs; check custom log flags and journald');
+            }
+        }
+
+        log(`${enabled ? 'enabled' : 'disabled'} Hysteria JSON journal shipping`);
+        return { success: true, agentVersion, journalUnit };
+    } catch (error) {
+        if (enabled && runtimeMutated && conn) {
+            // Enabling is transactional from the operator's perspective. If a
+            // later restart/readiness check fails, best-effort restore a
+            // disabled shipper and remove our debug drop-in so the node does
+            // not keep collecting exact endpoints while the panel says error.
+            try {
+                if (manageAgent && effectiveAccessLogs) {
+                    const disabledConfig = buildAgentConfig(
+                        preparedNode,
+                        token,
+                        agentPort,
+                        apiPort,
+                        useTls,
+                        { ...effectiveAccessLogs, enabled: false, ingestUrl: '', ingestToken: '' }
+                    );
+                    await uploadFile(conn, JSON.stringify(disabledConfig, null, 2), '/etc/cc-agent/config.json');
+                    await execSSH(conn, 'chmod 600 /etc/cc-agent/config.json');
+                }
+                for (const unit of ['hysteria-server', 'hysteria']) {
+                    await removeHysteriaAccessLogOverride(conn, unit);
+                }
+                const agentRollback = manageAgent
+                    ? 'systemctl restart cc-agent >/dev/null 2>&1 || true' : '';
+                await execSSH(conn, `systemctl daemon-reload >/dev/null 2>&1 || true
+${agentRollback}
+${journalUnit ? `systemctl restart ${journalUnit} >/dev/null 2>&1 || true` : ''}`);
+                log('rolled back failed Hysteria access-log enable');
+            } catch (rollbackError) {
+                logger.error(`[AccessLogs] Node ${preparedNode.name}: rollback failed: ${rollbackError.message}`);
+            }
+        }
+        throw error;
+    } finally {
+        if (conn) conn.end();
+    }
+}
+
+function reconcileHysteriaAccessLogs(node, accessLogs, options = {}) {
+    return enqueueCcAgentHostTask(
+        node,
+        () => reconcileHysteriaAccessLogsUnlocked(node, accessLogs, options)
+    );
 }
 
 module.exports = {
@@ -1671,15 +2480,37 @@ module.exports = {
     connectSSH,
     execSSH,
     uploadFile,
+    readRemoteFileIfExists,
+    assertCcAgentConfigContentOwnership,
+    assertCcAgentConfigOwnership,
+    assertNodeSshCcAgentConfigOwnership,
+    ccAgentHostKey,
+    enqueueCcAgentHostTask,
     setupXrayNode,
     setupXrayNodeWithAgent,
     installCCAgent,
     buildAgentConfig,
     reloadCcAgent,
+    reconcileHysteriaAccessLogs,
+    HYSTERIA_ACCESS_LOG_OVERRIDE_PATH,
+    hysteriaAccessLogOverridePath,
+    detectHysteriaSystemdUnit,
+    inspectHysteriaSystemdUnits,
+    assertHysteriaExecStartLoggingCompatible,
+    assertHysteriaEffectiveLoggingEnvironment,
+    waitForAgentAccessLogSourceReady,
+    hasStructuredHysteriaStartupLog,
+    removeHysteriaAccessLogOverride,
+    disableHysteriaAccessLogsRuntime,
     resolveNodeServiceCandidates,
     stopNodeRuntime,
     startNodeRuntime,
     generateAgentToken,
+    normalizeFirewallSource,
+    resolvePanelFirewallSource,
+    parseAgentVersion,
+    isAgentVersionAtLeast,
+    ensureNodeAgentToken,
     ensureXrayAgentToken,
     checkXrayNodeStatus,
     getXrayNodeLogs,

@@ -26,6 +26,12 @@ const cred = require('../src/services/accessLogs/credentialService');
     assert.strictEqual(h1, h1again, 'hash is deterministic');
     assert.strictEqual(h1.length, 64, 'sha256 hex = 64 chars');
     assert.notStrictEqual(h1, cred.hashToken(t2), 'different token -> different hash');
+
+    assert.strictEqual(cred.isEligibleIngestNode({ type: 'hysteria', cascadeRole: 'standalone' }), true);
+    assert.strictEqual(cred.isEligibleIngestNode({ type: 'xray', cascadeRole: 'portal' }), true);
+    assert.strictEqual(cred.isEligibleIngestNode({ type: 'hysteria', cascadeRole: 'bridge' }), false);
+    assert.strictEqual(cred.isEligibleIngestNode({ type: 'virtual', cascadeRole: 'standalone' }), false);
+    assert.strictEqual(cred.isEligibleIngestNode({ type: 'hysteria', cascadeRole: 'standalone', active: false }), false);
 }
 
 // --- settings model defaults ----------------------------------------------
@@ -59,4 +65,58 @@ const cred = require('../src/services/accessLogs/credentialService');
     assert.ok(path, 'xray subdocument path exists');
 }
 
-console.log('test-access-logs-credentials: OK');
+(async () => {
+    const HyNode = require('../src/models/hyNodeModel');
+    const cryptoService = require('../src/services/cryptoService');
+    const original = {
+        findById: HyNode.findById,
+        findOneAndUpdate: HyNode.findOneAndUpdate,
+    };
+    let encrypted = '';
+    let storedHash = '';
+    let initialReads = 0;
+    let releaseInitialReads;
+    const bothRead = new Promise(resolve => { releaseInitialReads = resolve; });
+    const document = () => ({
+        xray: { accessLogs: { ingestTokenEncrypted: encrypted, ingestTokenHash: storedHash } },
+    });
+
+    try {
+        HyNode.findById = () => ({
+            select: async () => {
+                initialReads++;
+                if (initialReads === 2) releaseInitialReads();
+                if (initialReads <= 2) await bothRead;
+                return document();
+            },
+        });
+        HyNode.findOneAndUpdate = (filter, update) => ({
+            select: async () => {
+                const expected = filter['xray.accessLogs.ingestTokenEncrypted'];
+                const permitsEmpty = Array.isArray(filter.$or);
+                const matches = expected !== undefined ? encrypted === expected : permitsEmpty && encrypted === '';
+                if (!matches) return null;
+                encrypted = update.$set['xray.accessLogs.ingestTokenEncrypted'];
+                storedHash = update.$set['xray.accessLogs.ingestTokenHash'];
+                return document();
+            },
+        });
+
+        const [first, second] = await Promise.all([
+            cred.ensureIngestToken({ _id: 'concurrent-node' }),
+            cred.ensureIngestToken({ _id: 'concurrent-node' }),
+        ]);
+        assert.strictEqual(first.token, second.token, 'concurrent callers return the same CAS winner');
+        assert.strictEqual(storedHash, cred.hashToken(first.token));
+        assert.strictEqual(cryptoService.decrypt(encrypted), first.token);
+        assert.strictEqual([first.created, second.created].filter(Boolean).length, 1);
+    } finally {
+        HyNode.findById = original.findById;
+        HyNode.findOneAndUpdate = original.findOneAndUpdate;
+    }
+
+    console.log('test-access-logs-credentials: OK');
+})().catch(error => {
+    console.error('test-access-logs-credentials FAILED:', error);
+    process.exit(1);
+});

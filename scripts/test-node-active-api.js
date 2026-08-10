@@ -15,6 +15,7 @@ let runtimeStopResult = { success: true, attempted: true, service: 'xray', activ
 let runtimeStartResult = { success: true, attempted: true, service: 'hysteria-server', active: true };
 let xraySyncResult = true;
 let firewallResult = true;
+let accessLogReconcileCalls = 0;
 
 function clone(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -83,6 +84,9 @@ const stubs = {
         schedulePush: () => {
             throw new Error('schedulePush must not be called by active toggles');
         },
+    },
+    '../services/accessLogs/provisionService': {
+        scheduleReconcile: () => { accessLogReconcileCalls += 1; },
     },
     '../utils/logger': {
         info: () => {},
@@ -157,6 +161,7 @@ function reset() {
     runtimeStartResult = { success: true, attempted: true, service: 'hysteria-server', active: true };
     xraySyncResult = true;
     firewallResult = true;
+    accessLogReconcileCalls = 0;
 }
 
 (async () => {
@@ -185,6 +190,7 @@ function reset() {
     assert.strictEqual(db.get('xray-1').status, 'offline');
     assert.strictEqual(db.get('xray-1').onlineUsers, 0);
     assert.strictEqual(invalidateCount, 1);
+    assert.strictEqual(accessLogReconcileCalls, 1);
 
     reset();
     db.set('hysteria-1', {
@@ -216,6 +222,7 @@ function reset() {
     assert.strictEqual(db.get('hysteria-1').active, true);
     assert.strictEqual(db.get('hysteria-1').lastError, '');
     assert.strictEqual(invalidateCount, 1);
+    assert.strictEqual(accessLogReconcileCalls, 1);
 
     reset();
     db.set('hysteria-firewall-failed', {

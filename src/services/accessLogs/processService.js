@@ -20,6 +20,7 @@
  */
 
 const zlib = require('zlib');
+const net = require('net');
 const { promisify } = require('util');
 const fsp = require('fs/promises');
 const path = require('path');
@@ -43,6 +44,22 @@ let running = false;
 let timer = null;
 let kickPending = false;
 
+// Serialize storage-changing operations across ingest, drain and admin purge.
+// In particular, purge must wait for an insert that has already read a spool
+// file; otherwise that insert could land after ClickHouse was truncated and
+// silently resurrect records the administrator just deleted.
+let storageOperationTail = Promise.resolve();
+function withStorageLock(operation) {
+    if (typeof operation !== 'function') {
+        return Promise.reject(new TypeError('storage operation must be a function'));
+    }
+    const run = storageOperationTail.then(operation, operation);
+    // Keep the queue usable after a failed operation without creating an
+    // unhandled rejection from a discarded finally-derived promise.
+    storageOperationTail = run.then(() => undefined, () => undefined);
+    return run;
+}
+
 // Cached maskClientIp flag (checked per drain run, cheap TTL cache).
 let _maskCache = { value: false, at: 0 };
 const MASK_TTL_MS = 30 * 1000;
@@ -61,6 +78,10 @@ async function shouldMaskClientIp() {
     return _maskCache.value;
 }
 
+function resetMaskCache() {
+    _maskCache = { value: false, at: 0 };
+}
+
 /**
  * Privacy mask for client IPs (settings.accessLogs.maskClientIp).
  * IPv4 keeps the /24 (last octet zeroed); IPv6 keeps the first three hextets.
@@ -68,23 +89,78 @@ async function shouldMaskClientIp() {
  */
 function maskIp(ip) {
     if (!ip) return '';
-    const v4 = ip.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/);
-    if (v4) return `${v4[1]}.0`;
-    if (ip.includes(':')) {
-        const parts = ip.split(':');
-        return parts.slice(0, 3).join(':') + '::';
+    if (net.isIP(ip) === 4) {
+        const octets = ip.split('.');
+        return `${octets[0]}.${octets[1]}.${octets[2]}.0`;
+    }
+    if (net.isIP(ip) === 6) {
+        const halves = ip.toLowerCase().split('::');
+        const left = halves[0] ? halves[0].split(':') : [];
+        const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+
+        // Convert a possible IPv4-mapped tail into its two IPv6 hextets.
+        const tail = right.length ? right : left;
+        const last = tail[tail.length - 1] || '';
+        if (last.includes('.')) {
+            const octets = last.split('.').map(Number);
+            tail.splice(tail.length - 1, 1,
+                ((octets[0] << 8) | octets[1]).toString(16),
+                ((octets[2] << 8) | octets[3]).toString(16));
+        }
+
+        const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
+        const expanded = halves.length === 2
+            ? [...left, ...Array(Math.max(0, missing)).fill('0'), ...right]
+            : left;
+        if (expanded.length === 8) {
+            return expanded.slice(0, 3)
+                .map(part => Number.parseInt(part || '0', 16).toString(16))
+                .join(':') + '::';
+        }
     }
     return ip;
 }
 
-// The source IP is the first token after the timestamp on an Xray access line
-// (optionally prefixed by "from "). Mask it in place so the exact address never
-// reaches storage when masking is enabled. Best-effort: a line that does not
-// match is passed through unchanged (it will land with parse_ok handling in CH).
-const SRC_IP_RE = /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?:from\s+)?)([^\s:]+)/;
+// The source endpoint is the first token after the timestamp on the normalized
+// access line (optionally prefixed by "from "). Capture the WHOLE token: IPv6
+// endpoints contain colons and are normally bracketed, so stopping at the first
+// colon would only mask a fragment and leak the rest of the address.
+const SRC_ENDPOINT_RE = /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?:from\s+)?)(\S+)/;
+
+function maskSourceEndpoint(endpoint) {
+    if (!endpoint) return endpoint;
+
+    // Xray may prefix the endpoint with its transport (tcp:/udp:). Keep that
+    // prefix because the ClickHouse parser already knows how to remove it.
+    const protoMatch = /^(tcp:|udp:)(.*)$/i.exec(endpoint);
+    const proto = protoMatch ? protoMatch[1] : '';
+    const value = protoMatch ? protoMatch[2] : endpoint;
+
+    // net.Addr.String() represents IPv6 endpoints as [addr]:port. HY2 uses
+    // exactly this form for its `addr` field.
+    const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(value);
+    if (bracketed) {
+        const masked = net.isIP(bracketed[1]) === 6 ? maskIp(bracketed[1]) : '::';
+        return `${proto}[${masked}]${bracketed[2] ? `:${bracketed[2]}` : ''}`;
+    }
+
+    // IPv4 with an optional port. A bare IPv6 address is also handled by
+    // maskIp below; unbracketed IPv6+port is intentionally left untouched
+    // because it is ambiguous and is not emitted by Xray/Hysteria net.Addr.
+    const ipv4 = /^((?:\d{1,3}\.){3}\d{1,3})(?::(\d+))?$/.exec(value);
+    if (ipv4) {
+        return `${proto}${maskIp(ipv4[1])}${ipv4[2] ? `:${ipv4[2]}` : ''}`;
+    }
+    if (value.includes(':') && !/]:\d+$/.test(value)) {
+        const masked = maskIp(value);
+        return `${proto}${masked === value ? '::' : masked}`;
+    }
+    return endpoint;
+}
+
 function maskRawLine(raw) {
     if (!raw) return raw;
-    return raw.replace(SRC_IP_RE, (m, prefix, ip) => prefix + maskIp(ip));
+    return raw.replace(SRC_ENDPOINT_RE, (m, prefix, endpoint) => prefix + maskSourceEndpoint(endpoint));
 }
 
 // Parse a single spool file into ClickHouse raw rows tagged with the node id.
@@ -153,9 +229,7 @@ async function processFile(filePath, mask) {
 // hammering ClickHouse when it is unreachable.
 let storageUnavailable = false;
 
-async function drainOnce() {
-    if (running) { kickPending = true; return { processed: 0, skipped: true }; }
-    running = true;
+async function drainOnceUnlocked() {
     let processedFiles = 0;
     let totalEvents = 0;
     try {
@@ -185,8 +259,6 @@ async function drainOnce() {
         }
     } catch (e) {
         logger.error(`[AccessLogs] drain failed: ${e.message}`);
-    } finally {
-        running = false;
     }
     if (processedFiles > 0) {
         logger.info(`[AccessLogs] drained ${processedFiles} batch(es), ${totalEvents} event(s)`);
@@ -198,6 +270,72 @@ async function drainOnce() {
         setImmediate(() => { drainOnce().catch(() => {}); });
     }
     return { processed: processedFiles, events: totalEvents };
+}
+
+async function drainOnce() {
+    if (running) { kickPending = true; return { processed: 0, skipped: true }; }
+    running = true;
+    try {
+        return await withStorageLock(drainOnceUnlocked);
+    } finally {
+        running = false;
+    }
+}
+
+// Delete both durable pending batches and the ClickHouse dataset as one
+// operation relative to ingest/drain. Truncate runs first: if storage is down,
+// pending spool data remains intact and the API reports failure instead of
+// claiming success after deleting the only recoverable copy.
+async function purgeStoredData() {
+    return withStorageLock(async () => {
+        const paths = require('./paths');
+        const Settings = require('../../models/settingsModel');
+        const tombstone = `${paths.INCOMING_DIR}.purge-${process.pid}-${Date.now()}`;
+        let movedAside = false;
+        let truncated = false;
+
+        // Move pending files out of the processor's scan path atomically before
+        // truncating. If deletion later fails, they cannot be reinserted into an
+        // already-cleared ClickHouse table.
+        await fsp.mkdir(paths.DATA_ROOT, { recursive: true });
+        try {
+            await fsp.rename(paths.INCOMING_DIR, tombstone);
+            movedAside = true;
+        } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+        }
+        await fsp.mkdir(paths.INCOMING_TMP_DIR, { recursive: true });
+
+        try {
+            await clickhouse.truncate();
+            truncated = true;
+            if (movedAside) {
+                await fsp.rm(tombstone, { recursive: true, force: true });
+            }
+            await Settings.update({
+                'accessLogs.stats.ingestedBatches': 0,
+                'accessLogs.stats.rejectedBatches': 0,
+                'accessLogs.stats.duplicateBatches': 0,
+                'accessLogs.stats.lastIngestAt': null,
+            });
+            return { ok: true };
+        } catch (error) {
+            // A failed truncate means no purge occurred, so restore the durable
+            // spool exactly where the processor expects it. Once truncate has
+            // succeeded we intentionally never restore: doing so would revive
+            // deleted records on the next drain.
+            if (!truncated && movedAside) {
+                try {
+                    await fsp.rm(paths.INCOMING_DIR, { recursive: true, force: true });
+                    await fsp.rename(tombstone, paths.INCOMING_DIR);
+                } catch (restoreError) {
+                    logger.error(`[AccessLogs] purge spool restore failed: ${restoreError.message}`);
+                    error.message = `${error.message}; spool restore failed: ${restoreError.message}`;
+                }
+            }
+            throw error;
+        }
+    });
 }
 
 // Nudge the processor to run soon (debounced by the single-flight guard).
@@ -222,9 +360,12 @@ module.exports = {
     stop,
     kick,
     drainOnce,
+    withStorageLock,
+    purgeStoredData,
     // exported for tests
     maskIp,
     maskRawLine,
     parseSpoolFile,
     processFile,
+    resetMaskCache,
 };

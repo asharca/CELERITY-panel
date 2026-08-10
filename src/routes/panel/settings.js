@@ -96,16 +96,16 @@ router.get('/settings', async (req, res) => {
             maxBytes: homepageService.MAX_CUSTOM_BYTES,
         };
 
-        // Eligible nodes for access-log collection: client-facing Xray nodes
-        // (standalone or portal). Used by the access-logs settings tab.
+        // Eligible nodes for access-log collection: client-facing Xray and
+        // Hysteria nodes (standalone or portal).
         let accessLogNodes = [];
         try {
             const HyNode = require('../../models/hyNodeModel');
             accessLogNodes = await HyNode.find({
-                type: 'xray',
+                type: { $in: ['xray', 'hysteria'] },
                 cascadeRole: { $in: ['standalone', 'portal'] },
             })
-                .select('name cascadeRole agentVersion xray.accessLogs.status xray.accessLogs.lastError xray.accessLogs.lastBatchAt')
+                .select('name type cascadeRole agentVersion xray.accessLogs.status xray.accessLogs.lastError xray.accessLogs.lastBatchAt')
                 .lean();
         } catch (e) {
             logger.warn(`[Panel] accessLogNodes: ${e.message}`);
@@ -374,7 +374,7 @@ router.post('/settings', async (req, res) => {
             updates['backup.s3.keepLast'] = parseInt(req.body['backup.s3.keepLast']) || 30;
         }
 
-        // Access-logs settings (opt-in Xray access-log collection & analytics).
+        // Access-logs settings (opt-in Xray/Hysteria collection & analytics).
         // Its own form carries the _accessLogsSettings marker, so an absent
         // checkbox means "off". Actual node provisioning is kicked off after the
         // settings are persisted (below), never inline with the request.
@@ -448,10 +448,13 @@ router.post('/settings', async (req, res) => {
         }
 
         // Kick off access-log reconciliation in the background so the request
-        // stays fast (Xray restarts on nodes must not block the HTTP response).
+        // stays fast (proxy restarts on nodes must not block the HTTP response).
         // Also ensure the ClickHouse schema exists and its retention TTL matches
         // the saved setting; both are idempotent and off the request path.
         if (accessLogsToggled) {
+            // Apply a mask/unmask change to the very next drained batch instead
+            // of retaining the processor's previous 30-second cache value.
+            require('../../services/accessLogs/processService').resetMaskCache();
             setImmediate(async () => {
                 const clickhouse = require('../../services/accessLogs/clickhouseService');
                 try {

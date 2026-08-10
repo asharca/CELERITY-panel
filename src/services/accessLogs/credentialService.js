@@ -22,6 +22,13 @@ function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
+function isEligibleIngestNode(node) {
+    return !!node
+        && ['xray', 'hysteria'].includes(node.type)
+        && ['standalone', 'portal'].includes(node.cascadeRole)
+        && node.active !== false;
+}
+
 /**
  * Ensure a node has an ingest credential. Returns the plaintext token so the
  * caller can write it into the agent config. Idempotent: reuses the existing
@@ -49,16 +56,42 @@ async function ensureIngestToken(node, opts = {}) {
     }
 
     const token = generateToken();
-    await HyNode.updateOne(
-        { _id: node._id },
+    const encrypted = cryptoService.encrypt(token);
+    const encryptedPath = 'xray.accessLogs.ingestTokenEncrypted';
+    const compare = existingEnc
+        ? { [encryptedPath]: existingEnc }
+        : {
+            $or: [
+                { [encryptedPath]: { $exists: false } },
+                { [encryptedPath]: '' },
+            ],
+        };
+
+    // Compare-and-set prevents two simultaneous first-time config pushes from
+    // generating different credentials and leaving one agent with a token that
+    // no longer matches MongoDB. The loser re-reads and returns the winner.
+    const installed = await HyNode.findOneAndUpdate(
+        { _id: node._id, ...compare },
         {
             $set: {
-                'xray.accessLogs.ingestTokenEncrypted': cryptoService.encrypt(token),
+                [encryptedPath]: encrypted,
                 'xray.accessLogs.ingestTokenHash': hashToken(token),
             },
-        }
-    );
-    return { token, created: true };
+        },
+        { new: true }
+    ).select(`+${encryptedPath}`);
+    if (installed) return { token, created: true };
+
+    const winner = await HyNode.findById(node._id).select(`+${encryptedPath}`);
+    const winnerEncrypted = winner?.xray?.accessLogs?.ingestTokenEncrypted || '';
+    if (!winnerEncrypted) {
+        throw new Error(`Could not persist ingest credential for node ${node._id}`);
+    }
+    const winnerToken = cryptoService.decrypt(winnerEncrypted);
+    if (!winnerToken) {
+        throw new Error(`Could not decrypt ingest credential for node ${node._id}`);
+    }
+    return { token: winnerToken, created: false };
 }
 
 /**
@@ -101,6 +134,11 @@ async function resolveNodeByToken(token) {
     const b = Buffer.from(stored, 'hex');
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
     if (!node.xray?.accessLogs?.enabled) return null;
+    // A role/type conversion is committed before the asynchronous remote
+    // teardown finishes. Reject ingestion immediately once the node no longer
+    // terminates client traffic, so a stale agent cannot keep writing data in
+    // that reconciliation window.
+    if (!isEligibleIngestNode(node)) return null;
 
     return node;
 }
@@ -108,6 +146,7 @@ async function resolveNodeByToken(token) {
 module.exports = {
     hashToken,
     generateToken,
+    isEligibleIngestNode,
     ensureIngestToken,
     revokeIngestToken,
     resolveNodeByToken,

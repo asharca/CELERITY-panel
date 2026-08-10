@@ -25,11 +25,14 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", a.auth(a.handleHealth))
 	mux.HandleFunc("GET /info", a.auth(a.handleInfo))
 	mux.HandleFunc("POST /connect", a.auth(a.handleConnect))
-	mux.HandleFunc("POST /sync", a.auth(a.handleSync))
-	mux.HandleFunc("POST /users", a.auth(a.handleAddUser))
-	mux.HandleFunc("DELETE /users/{email}", a.auth(a.handleRemoveUser))
-	mux.HandleFunc("GET /stats", a.auth(a.handleStats))
-	mux.HandleFunc("POST /restart", a.auth(a.handleRestart))
+	// Keep the Xray routes registered for API compatibility, but put a hard
+	// mode gate in front of every one. Hysteria-only agents must never reach a
+	// handler that can touch gRPC, users.json, Xray config, stats, or systemd.
+	mux.HandleFunc("POST /sync", a.auth(a.xrayOnly(a.handleSync)))
+	mux.HandleFunc("POST /users", a.auth(a.xrayOnly(a.handleAddUser)))
+	mux.HandleFunc("DELETE /users/{email}", a.auth(a.xrayOnly(a.handleRemoveUser)))
+	mux.HandleFunc("GET /stats", a.auth(a.xrayOnly(a.handleStats)))
+	mux.HandleFunc("POST /restart", a.auth(a.xrayOnly(a.handleRestart)))
 }
 
 // auth middleware validates the Bearer token
@@ -39,6 +42,16 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		token := strings.TrimPrefix(auth, "Bearer ")
 		if token == "" || token == auth || token != a.cfg.Token {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *API) xrayOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.IsHysteriaOnly() {
+			jsonErr(w, http.StatusNotImplemented, "xray operation is not applicable in hysteria-only mode")
 			return
 		}
 		next(w, r)
@@ -58,17 +71,28 @@ func jsonErr(w http.ResponseWriter, code int, msg string) {
 
 // GET /health — simple liveness probe
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
-	jsonOK(w, map[string]string{"status": "ok"})
+	jsonOK(w, map[string]string{"status": "ok", "mode": a.cfg.RuntimeMode()})
 }
 
 // GET /info — version, uptime, user count, and access-log module status.
 func (a *API) handleInfo(w http.ResponseWriter, r *http.Request) {
+	xrayVersion := "not-applicable"
+	usersCount := 0
+	var lastSync any
+	if !a.cfg.IsHysteriaOnly() {
+		xrayVersion = getXrayVersion()
+		if a.userStore != nil {
+			usersCount = a.userStore.Count()
+			lastSync = a.userStore.GetLastSync()
+		}
+	}
 	info := map[string]any{
 		"agent_version":  Version,
-		"xray_version":   getXrayVersion(),
+		"mode":           a.cfg.RuntimeMode(),
+		"xray_version":   xrayVersion,
 		"uptime_seconds": int(time.Since(startTime).Seconds()),
-		"users_count":    a.userStore.Count(),
-		"last_sync":      a.userStore.GetLastSync(),
+		"users_count":    usersCount,
+		"last_sync":      lastSync,
 	}
 	if a.shipper != nil {
 		info["access_logs"] = a.shipper.Status()
@@ -80,10 +104,15 @@ func (a *API) handleInfo(w http.ResponseWriter, r *http.Request) {
 
 // POST /connect — handshake; panel calls this to verify connectivity
 func (a *API) handleConnect(w http.ResponseWriter, r *http.Request) {
+	xrayVersion := "not-applicable"
+	if !a.cfg.IsHysteriaOnly() {
+		xrayVersion = getXrayVersion()
+	}
 	jsonOK(w, map[string]any{
 		"status":        "connected",
 		"agent_version": Version,
-		"xray_version":  getXrayVersion(),
+		"mode":          a.cfg.RuntimeMode(),
+		"xray_version":  xrayVersion,
 	})
 }
 

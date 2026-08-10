@@ -137,13 +137,15 @@ router.post('/ingest', async (req, res) => {
             return res.status(200).json({ ok: true, duplicate: true });
         }
 
-        await spoolService.persistBatch(nodeId, batchId, body);
-
-        await bumpStats({ ingestedBatches: 1, lastIngestAt: new Date() });
-        await touchNode(nodeId, body.length);
+        const processService = require('../services/accessLogs/processService');
+        await processService.withStorageLock(async () => {
+            await spoolService.persistBatch(nodeId, batchId, body);
+            await bumpStats({ ingestedBatches: 1, lastIngestAt: new Date() });
+            await touchNode(nodeId, body.length);
+        });
 
         // Nudge the processor (best-effort; it also runs on an interval).
-        try { require('../services/accessLogs/processService').kick(); } catch (_) { /* not loaded yet */ }
+        try { processService.kick(); } catch (_) { /* not loaded yet */ }
 
         return res.status(202).json({ ok: true, batchId });
     } catch (err) {

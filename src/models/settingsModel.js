@@ -141,7 +141,7 @@ const settingsSchema = new mongoose.Schema({
         completedAt: { type: Date, default: null },
     },
 
-    // Opt-in Xray access-logs collection & analytics. Disabled by default so
+    // Opt-in Xray/Hysteria access-log collection & analytics. Disabled by default so
     // the pipeline stays completely inert (no node provisioning, no ingest)
     // until an admin explicitly turns it on.
     accessLogs: {
@@ -167,11 +167,12 @@ const settingsSchema = new mongoose.Schema({
             passwordEncrypted: { type: String, default: '' },
             secure: { type: Boolean, default: false },
         },
-        // Which nodes ship access logs: all eligible xray nodes, or a subset.
+        // Which nodes ship access logs: all eligible Xray/Hysteria nodes, or a subset.
         nodeScope: { type: String, enum: ['all', 'selected'], default: 'all' },
         nodeIds: { type: [String], default: [] },
-        // Privacy: mask client IPs before storage. When on, exact source-IP
-        // search is not possible (documented in the UI).
+        // Privacy: mask client IPs before ClickHouse insertion. Journald and
+        // bounded retry spools can still contain exact endpoints temporarily;
+        // exact source-IP search in analytics is not possible when enabled.
         maskClientIp: { type: Boolean, default: false },
         // Full ingest endpoint pushed to agents; empty = derive from BASE_URL.
         ingestUrl: { type: String, default: '' },
@@ -252,4 +253,3 @@ settingsSchema.statics.update = async function(updates) {
 };
 
 module.exports = mongoose.model('Settings', settingsSchema);
-

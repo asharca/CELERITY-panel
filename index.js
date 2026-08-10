@@ -739,19 +739,18 @@ async function startServer() {
             }
         }, 15 * 1000);
 
-        // Crash recovery: if the panel died mid-reconcile the access-logs state
-        // stays stuck in a transitional value. Re-run reconciliation once on
-        // boot (delayed so nodes/DB settle first); it is a no-op fast path when
-        // every node already matches the desired config.
+        // Reconcile once on every boot (delayed so nodes/DB settle first). In
+        // addition to crash recovery this upgrades per-node runtime metadata
+        // and tears down stale sources after a role/type change that happened
+        // while an older panel version was running. Healthy nodes take the
+        // fingerprint fast path.
         setTimeout(async () => {
             try {
                 const Settings = require('./src/models/settingsModel');
                 const s = await Settings.get();
                 const state = s?.accessLogs?.state;
-                if (state === 'enabling' || state === 'disabling' || state === 'error') {
-                    logger.info(`[AccessLogs] state '${state}' at boot — resuming reconciliation`);
-                    await require('./src/services/accessLogs/provisionService').reconcileAll();
-                }
+                logger.info(`[AccessLogs] reconciling access-log runtime at boot (state='${state || 'disabled'}')`);
+                await require('./src/services/accessLogs/provisionService').reconcileAll();
             } catch (e) {
                 logger.warn(`[AccessLogs] boot reconcile skipped: ${e.message}`);
             }

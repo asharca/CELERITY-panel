@@ -58,6 +58,16 @@ async function persistBatch(nodeId, batchId, bytes) {
     }
     await fsp.rename(tmpPath, finalPath);
 
+    // fsync the containing directory as well as the file. Without this, a
+    // sudden power loss after the 202 response can forget the rename even
+    // though the file contents themselves were synced.
+    const dir = await fsp.open(paths.INCOMING_DIR, 'r');
+    try {
+        await dir.sync();
+    } finally {
+        await dir.close();
+    }
+
     return { path: finalPath, name, bytes: bytes.length };
 }
 

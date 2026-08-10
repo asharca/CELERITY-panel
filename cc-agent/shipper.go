@@ -13,10 +13,33 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
 )
+
+// Xray writes access records and ordinary process diagnostics to the same
+// stdout stream. When journald is the source, retain only the two raw shapes
+// understood by the panel's ClickHouse parser: destination-bearing access
+// records and connection-level handshake errors. This keeps warnings/startup
+// messages out of the bounded spool and prevents them inflating analytics.
+var (
+	xrayAccessRecordRE = regexp.MustCompile(
+		`^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+` +
+			`(?:from\s+)?\S+\s+(?:accepted|rejected|blocked)\s+` +
+			`(?:tcp|udp)\s*:\s*\S+(?:\s+\[[^\]]*\])?` +
+			`(?:\s+email:\s*\S(?:.*\S)?)?\s*$`,
+	)
+	xrayHandshakeErrorRE = regexp.MustCompile(
+		`^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+` +
+			`(?:from\s+)?\S+\s+(?:accepted|rejected|blocked)(?:\s|$)`,
+	)
+)
+
+func isXrayAccessRecord(line string) bool {
+	return xrayAccessRecordRE.MatchString(line) || xrayHandshakeErrorRE.MatchString(line)
+}
 
 // spoolEvent is one NDJSON record shipped to the panel. The panel parses the
 // raw line; the agent only forwards it with minimal metadata.
@@ -30,12 +53,26 @@ type spoolEvent struct {
 // health without it affecting the node's core health.
 type ShipperStatus struct {
 	Enabled       bool   `json:"enabled"`
+	Source        string `json:"source,omitempty"`
+	Format        string `json:"format,omitempty"`
+	JournalUnit   string `json:"journal_unit,omitempty"`
+	SourceReady   bool   `json:"source_ready"`
 	SpoolBytes    int64  `json:"spool_bytes"`
 	SpoolBatches  int    `json:"spool_batches"`
 	LagBytes      int64  `json:"lag_bytes"`
 	DroppedEvents int64  `json:"dropped_events"`
+	InvalidEvents int64  `json:"invalid_events"`
 	LastShipAt    string `json:"last_ship_at"`
 	LastError     string `json:"last_error"`
+	SourceError   string `json:"source_error,omitempty"`
+	SourceWarning string `json:"source_warning,omitempty"`
+}
+
+type accessLogSource interface {
+	Run()
+	Stop()
+	LagBytes() int64
+	Ready() bool
 }
 
 // Shipper batches tailed lines, writes them to a bounded disk spool as
@@ -44,12 +81,14 @@ type Shipper struct {
 	cfg      *AccessLogsConfig
 	spoolDir string
 	client   *http.Client
-	tailer   *Tailer
+	source   accessLogSource
 
 	mu            sync.Mutex
+	flushMu       sync.Mutex
 	pending       []rawLine
 	spoolBytes    int64
 	droppedEvents int64
+	invalidEvents int64
 	lastShipAt    time.Time
 	lastError     string
 
@@ -74,26 +113,59 @@ func NewShipper(cfg *Config) *Shipper {
 		doneCh:   make(chan struct{}),
 	}
 
-	cursorPath := filepath.Join(cfg.DataDir, "accesslog-cursor.json")
-	s.tailer = NewTailer(al.Path, cursorPath, al.FileMaxBytes, s.onLines, s.canTruncate)
+	if al.Source == accessLogSourceJournal {
+		cursorPath := filepath.Join(cfg.DataDir, "accesslog-journal-cursor.json")
+		s.source = NewJournalTailer(al.JournalUnit, cursorPath, s.onLines, s.canCheckpoint)
+	} else {
+		// Keep the legacy cursor name so existing Xray agents resume exactly
+		// where pre-1.5.0 binaries stopped.
+		cursorPath := filepath.Join(cfg.DataDir, "accesslog-cursor.json")
+		s.source = NewTailer(al.Path, cursorPath, al.FileMaxBytes, s.onLines, s.canCheckpoint)
+	}
 	return s
 }
 
-// canTruncate reports whether there is no pending in-memory batch and the spool
-// is empty, so the tailer can safely truncate the source file.
-func (s *Shipper) canTruncate() bool {
+// canCheckpoint reports that every accepted line emitted so far is durably in a
+// sealed spool file. Source cursors must not advance while an event exists only
+// in memory, otherwise a process crash could skip that access permanently.
+func (s *Shipper) canCheckpoint() bool {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
-	pending := len(s.pending)
-	s.mu.Unlock()
-	if pending > 0 {
-		return false
-	}
-	batches, _, _ := s.listSpool()
-	return len(batches) == 0
+	defer s.mu.Unlock()
+	return len(s.pending) == 0
 }
 
 // onLines buffers completed lines; the flush loop turns them into batches.
 func (s *Shipper) onLines(lines []rawLine) {
+	if s.cfg.Source == accessLogSourceJournal && s.cfg.Format == accessLogFormatXray {
+		filtered := make([]rawLine, 0, len(lines))
+		for _, line := range lines {
+			if isXrayAccessRecord(line.Line) {
+				filtered = append(filtered, line)
+			}
+		}
+		lines = filtered
+	} else if s.cfg.Format == accessLogFormatHysteria2JSON {
+		normalized := make([]rawLine, 0, len(lines))
+		for _, line := range lines {
+			accessLine, result := normalizeHysteria2AccessLineDetailed(line.Line)
+			if result != hysteria2NormalizeAccepted {
+				if result == hysteria2NormalizeInvalid {
+					s.mu.Lock()
+					s.invalidEvents++
+					s.mu.Unlock()
+				}
+				continue
+			}
+			line.Line = accessLine
+			normalized = append(normalized, line)
+		}
+		lines = normalized
+	}
+	if len(lines) == 0 {
+		return
+	}
 	s.mu.Lock()
 	s.pending = append(s.pending, lines...)
 	shouldFlush := len(s.pending) >= s.cfg.BatchMaxEvents
@@ -107,14 +179,18 @@ func (s *Shipper) Start() {
 	if err := os.MkdirAll(s.spoolDir, 0755); err != nil {
 		log.Printf("[shipper] cannot create spool dir: %v", err)
 	}
-	go s.tailer.Run()
+	go s.source.Run()
 	go s.run()
-	log.Printf("[shipper] access-log shipping started (path=%s url=%s)", s.cfg.Path, s.cfg.IngestURL)
+	if s.cfg.Source == accessLogSourceJournal {
+		log.Printf("[shipper] access-log shipping started (journal=%s format=%s url=%s)", s.cfg.JournalUnit, s.cfg.Format, s.cfg.IngestURL)
+	} else {
+		log.Printf("[shipper] access-log shipping started (path=%s format=%s url=%s)", s.cfg.Path, s.cfg.Format, s.cfg.IngestURL)
+	}
 }
 
 // Stop drains the tailer, flushes pending lines, and stops delivery.
 func (s *Shipper) Stop() {
-	s.tailer.Stop()
+	s.source.Stop()
 	s.flush()
 	select {
 	case <-s.stopCh:
@@ -158,6 +234,17 @@ func (s *Shipper) run() {
 
 // flush turns the pending in-memory lines into a sealed spool batch file.
 func (s *Shipper) flush() {
+	s.flushMu.Lock()
+	s.flushPendingLocked()
+	s.flushMu.Unlock()
+
+	// Cursor persistence happens only after the flush lock is released: each
+	// source's Checkpoint calls canCheckpoint, which takes the same lock to prove
+	// the in-memory queue is empty and the spool rename has completed.
+	s.checkpointSource()
+}
+
+func (s *Shipper) flushPendingLocked() {
 	s.mu.Lock()
 	if len(s.pending) == 0 {
 		s.mu.Unlock()
@@ -183,16 +270,80 @@ func (s *Shipper) flush() {
 	path := filepath.Join(s.spoolDir, name)
 
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := writeAtomicDurable(path, tmp, data, 0600); err != nil {
 		log.Printf("[shipper] spool write failed: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		log.Printf("[shipper] spool rename failed: %v", err)
+		s.requeue(lines)
 		return
 	}
 
 	s.enforceSpoolCap()
+}
+
+// writeAtomicDurable seals one spool batch with the ordering required by the
+// source cursor checkpoint:
+//
+//	write tmp -> fsync(tmp) -> rename(tmp, final) -> fsync(spool directory)
+//
+// Only after this returns nil may a file/journal cursor advance. That keeps an
+// abrupt power loss from preserving a cursor while losing the corresponding
+// spool directory entry.
+func writeAtomicDurable(finalPath, tmpPath string, data []byte, perm os.FileMode) (err error) {
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err = f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, finalPath); err != nil {
+		return err
+	}
+	removeTmp = false
+
+	dir, err := os.Open(filepath.Dir(finalPath))
+	if err != nil {
+		return err
+	}
+	if err = dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
+}
+
+func (s *Shipper) checkpointSource() {
+	if s.source == nil {
+		return
+	}
+	if checkpointer, ok := s.source.(interface{ Checkpoint() }); ok {
+		checkpointer.Checkpoint()
+	}
+}
+
+func (s *Shipper) requeue(lines []rawLine) {
+	s.mu.Lock()
+	// These lines are older than anything appended while the disk write was in
+	// progress, so prepend them to preserve source order on the next flush.
+	pending := make([]rawLine, 0, len(lines)+len(s.pending))
+	pending = append(pending, lines...)
+	pending = append(pending, s.pending...)
+	s.pending = pending
+	s.mu.Unlock()
 }
 
 // listSpool returns sealed batch files (oldest first) and total size.
@@ -407,11 +558,39 @@ func (s *Shipper) Status() ShipperStatus {
 	}
 	return ShipperStatus{
 		Enabled:       true,
+		Source:        s.cfg.Source,
+		Format:        s.cfg.Format,
+		JournalUnit:   journalUnitForStatus(s.cfg),
+		SourceReady:   s.source.Ready(),
 		SpoolBytes:    total,
 		SpoolBatches:  len(files),
-		LagBytes:      s.tailer.LagBytes(),
+		LagBytes:      s.source.LagBytes(),
 		DroppedEvents: s.droppedEvents,
+		InvalidEvents: s.invalidEvents,
 		LastShipAt:    last,
 		LastError:     s.lastError,
+		SourceError:   accessLogSourceError(s.source),
+		SourceWarning: accessLogSourceWarning(s.source),
 	}
+}
+
+func journalUnitForStatus(cfg *AccessLogsConfig) string {
+	if cfg.Source == accessLogSourceJournal {
+		return cfg.JournalUnit
+	}
+	return ""
+}
+
+func accessLogSourceError(source accessLogSource) string {
+	if reporter, ok := source.(interface{ LastError() string }); ok {
+		return reporter.LastError()
+	}
+	return ""
+}
+
+func accessLogSourceWarning(source accessLogSource) string {
+	if reporter, ok := source.(interface{ Warning() string }); ok {
+		return reporter.Warning()
+	}
+	return ""
 }

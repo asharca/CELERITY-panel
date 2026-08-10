@@ -14,6 +14,7 @@ const { invalidateNodesCache } = require('../utils/helpers');
 const { normalizePortRange, parsePortRange, canonicalizePortRange } = require('../utils/portRange');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
+const accessLogProvisionService = require('../services/accessLogs/provisionService');
 
 function hasSshCredentials(node) {
     return !!(node?.ssh?.password || node?.ssh?.privateKey);
@@ -94,6 +95,7 @@ async function setNodeActive(req, res, active) {
             );
 
             await invalidateNodesCache();
+            accessLogProvisionService.scheduleReconcile();
 
             const warning = runtime.success === false
                 ? runtimeErrorMessage(runtime, 'Runtime stop failed')
@@ -152,6 +154,7 @@ async function setNodeActive(req, res, active) {
         );
 
         await invalidateNodesCache();
+        accessLogProvisionService.scheduleReconcile();
 
         logger.info(`[Nodes API] Enabled node ${node.name}`);
 
@@ -370,6 +373,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
 
         const node = new HyNode(nodeData);
         await node.save();
+        accessLogProvisionService.scheduleReconcile();
 
         await invalidateNodesCache();
 
@@ -423,7 +427,9 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
-        const existing = await HyNode.findById(req.params.id).select('type ip domain virtual port portRange active ssh').lean();
+        const existing = await HyNode.findById(req.params.id)
+            .select('name type ip domain virtual port portRange active ssh xray.agentToken xray.agentPort xray.apiPort xray.agentTls xray.accessLogs +xray.accessLogs.ingestTokenEncrypted')
+            .lean();
         if (!existing) {
             return res.status(404).json({ error: 'Node not found' });
         }
@@ -443,6 +449,25 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             updates.ip = null;
         } else if (!nextIp) {
             return res.status(400).json({ error: `Node type ${nextType} requires ip` });
+        }
+
+        // Access-log runtime markers are panel-owned write-ahead state. Never
+        // let a general Xray config update replace them, especially appliedSsh
+        // which may be the only credential capable of cleaning an old host.
+        if (Object.prototype.hasOwnProperty.call(updates, 'xray')
+            && (!updates.xray || typeof updates.xray !== 'object' || Array.isArray(updates.xray))) {
+            return res.status(400).json({ error: 'xray must be an object' });
+        }
+        if (updates.xray && typeof updates.xray === 'object') {
+            updates.xray = {
+                ...updates.xray,
+                agentToken: updates.xray.agentToken || existing.xray?.agentToken || '',
+                agentPort: updates.xray.agentPort || existing.xray?.agentPort,
+                apiPort: updates.xray.apiPort || existing.xray?.apiPort,
+                agentTls: updates.xray.agentTls !== undefined
+                    ? updates.xray.agentTls : existing.xray?.agentTls,
+                accessLogs: existing.xray?.accessLogs || {},
+            };
         }
 
         const node = await HyNode.findByIdAndUpdate(
@@ -473,6 +498,16 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             previousActive: existing.active,
             previousSsh: existing.ssh,
         });
+        accessLogProvisionService.scheduleReconcile({
+            previousNode: {
+                _id: req.params.id,
+                name: existing.name,
+                type: existing.type,
+                ip: existing.ip,
+                ssh: existing.ssh,
+                xray: existing.xray || {},
+            },
+        });
 
         // Invalidate cache
         await invalidateNodesCache();
@@ -491,10 +526,23 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
  */
 router.delete('/:id', requireScope('nodes:write'), async (req, res) => {
     try {
-        const node = await HyNode.findByIdAndDelete(req.params.id);
-        
+        const node = await HyNode.findById(req.params.id);
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
+        }
+
+        const provision = accessLogProvisionService;
+        try {
+            const deleted = await provision.deleteNodeWithAccessLogCleanup(node);
+            if (!deleted) {
+                return res.status(404).json({ error: 'Node not found' });
+            }
+        } catch (cleanupError) {
+            logger.error(`[Nodes API] Refusing to delete ${node.name}: access-log cleanup failed: ${cleanupError.message}`);
+            return res.status(409).json({
+                error: 'Remote access-log cleanup failed; node was not deleted',
+                detail: cleanupError.message,
+            });
         }
 
         require('../services/syncService').schedulePortHoppingCleanup(node);
@@ -851,6 +899,7 @@ router.post('/:id/setup', requireScope('nodes:write'), async (req, res) => {
             if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
             await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields });
             await invalidateNodesCache();
+            accessLogProvisionService.scheduleReconcile();
             logger.info(`[Nodes API] Auto-setup completed for ${node.name} (${node.type})`);
             res.json({ success: true, logs: result.logs });
         } else {
