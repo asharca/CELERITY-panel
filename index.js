@@ -520,19 +520,25 @@ async function startServer() {
             // Index already dropped or never existed — safe to ignore
         }
 
-        // Migration: rebuild compound {ip, type} unique index when it exists
-        // without a partial filter expression. Virtual nodes have ip=null, so the
-        // unique constraint must skip non-string ip values; Mongoose will not
-        // rewrite an existing index with new options on its own.
+        // Migration: replace the host-only compound index with an endpoint
+        // index. A single server can host separate Hysteria instances on
+        // different ports, so {ip, type} is too restrictive. Virtual nodes
+        // have ip=null, so the constraint must still skip non-string values.
         try {
             const indexes = await mongoose.connection.collection('hynodes').indexes();
             const ipType = indexes.find(idx => idx.name === 'ip_1_type_1');
-            if (ipType && !ipType.partialFilterExpression) {
+            if (ipType) {
                 await mongoose.connection.collection('hynodes').dropIndex('ip_1_type_1');
-                logger.info('[Migration] Dropped legacy ip_1_type_1 (non-partial) index');
-                await HyNode.syncIndexes();
-                logger.info('[Migration] Recreated hynodes indexes with partialFilterExpression');
+                logger.info('[Migration] Dropped legacy ip_1_type_1 endpoint-conflicting index');
             }
+            await mongoose.connection.collection('hynodes').createIndex(
+                { ip: 1, port: 1, type: 1 },
+                {
+                    unique: true,
+                    partialFilterExpression: { ip: { $type: 'string' } },
+                    name: 'ip_1_port_1_type_1',
+                }
+            );
         } catch (e) {
             logger.warn(`[Migration] hynodes index sync skipped: ${e.message}`);
         }

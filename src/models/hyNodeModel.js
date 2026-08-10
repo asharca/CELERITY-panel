@@ -473,10 +473,13 @@ const hyNodeSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
-// One IP may host at most one node per protocol type. Virtual nodes have no IP
-// (null), so the partial filter excludes them from the unique constraint.
+// A protocol endpoint is unique by host, port, and type. Virtual nodes have no
+// IP (null), so the partial filter excludes them from the unique constraint.
 hyNodeSchema.index(
-    { ip: 1, type: 1 },
+    // One host may legitimately expose several independent protocol
+    // instances on different ports (for example, separate NAT-backed HY2
+    // lines). Keep the endpoint, rather than just the host, unique.
+    { ip: 1, port: 1, type: 1 },
     { unique: true, partialFilterExpression: { ip: { $type: 'string' } } }
 );
 hyNodeSchema.index({ active: 1 });
