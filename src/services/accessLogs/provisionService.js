@@ -767,7 +767,11 @@ async function reconcileNode(node, settings, options = {}) {
         //  - the node already runs this exact config and is healthy, OR
         //  - target is "disabled" and the node was never provisioned for access
         //    logs at all (disabled is the default state — nothing to undo).
-        const neverProvisioned = !applied
+        // `disabled` is the persisted fingerprint for the default, never
+        // provisioned state. Treat it exactly like an empty fingerprint so a
+        // selected-node deployment does not try to SSH-clean up unrelated
+        // logical entries that only carry this local sentinel.
+        const neverProvisioned = (!applied || applied === 'disabled')
             && !(node.xray?.accessLogs?.enabled)
             && !node.xray?.accessLogs?.ingestTokenHash
             && !previousAppliedSource

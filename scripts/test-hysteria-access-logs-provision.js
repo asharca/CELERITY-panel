@@ -693,6 +693,40 @@ assert(
         assert.strictEqual(finalStatus, 'agent-missing');
         assert.strictEqual(remoteCalls, 1, 'missing SSH must not attempt remote installation');
 
+        // In selected-node mode, sibling logical entries may retain the local
+        // `disabled` fingerprint from a previous reconciliation. That marker
+        // is not a remote runtime and must not cause an SSH cleanup attempt.
+        const selectedSettings = {
+            ...settings,
+            accessLogs: {
+                ...settings.accessLogs,
+                nodeScope: 'selected',
+                nodeIds: ['legacy-hy'],
+            },
+        };
+        const unselectedLogicalNode = {
+            ...legacyHy,
+            _id: 'unselected-logical-node',
+            ssh: {},
+            xray: {
+                accessLogs: {
+                    enabled: false,
+                    status: 'error',
+                    appliedFingerprint: 'disabled',
+                    appliedSource: '',
+                    pendingSource: '',
+                    cleanupRequired: false,
+                },
+            },
+        };
+        finalStatus = '';
+        const callsBeforeScopeSkip = remoteCalls;
+        const scopeSkipResult = await provision.reconcileNode(unselectedLogicalNode, selectedSettings);
+        assert.strictEqual(scopeSkipResult.status, 'disabled');
+        assert.strictEqual(finalStatus, 'disabled');
+        assert.strictEqual(remoteCalls, callsBeforeScopeSkip,
+            'an unselected logical entry must not require SSH cleanup');
+
         const movedBlockedResult = await provision.reconcileNode(movedBlockedHy, settings);
         assert.strictEqual(movedBlockedResult.status, 'agent-missing');
         assert.strictEqual(remoteCalls, 2, 'old host cleanup runs before the new-host prerequisite returns');
