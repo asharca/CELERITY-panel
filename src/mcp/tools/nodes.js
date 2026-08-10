@@ -311,6 +311,7 @@ async function manageNode(args, emit) {
         case 'create': {
             if (!data.name) throw new Error('name is required for create');
             const nodeType = data.type || 'hysteria';
+            const nodePort = parseInt(data.port, 10) || 443;
 
             if (nodeType !== 'virtual' && !data.ip) {
                 throw new Error('ip is required for hysteria and xray nodes');
@@ -328,8 +329,8 @@ async function manageNode(args, emit) {
                     return { error: 'Virtual node (manual): at least one source required', code: 400 };
                 }
             } else {
-                const existing = await HyNode.findOne({ ip: data.ip, type: nodeType });
-                if (existing) return { error: `A ${nodeType} node with this IP already exists`, code: 409 };
+                const existing = await HyNode.findOne({ ip: data.ip, port: nodePort, type: nodeType });
+                if (existing) return { error: `A ${nodeType} node already exists at ${data.ip}:${nodePort}`, code: 409 };
             }
 
             const statsSecret = cryptoService.generateNodeSecret();
@@ -360,7 +361,7 @@ async function manageNode(args, emit) {
                 type: nodeType,
                 domain: data.domain || '',
                 sni: data.sni || '',
-                port: data.port || 443,
+                port: nodePort,
                 portRange: normalizedPortRange,
                 statsHost: typeof data.statsHost === 'string' ? data.statsHost.trim() : '',
                 statsPort: 9999,

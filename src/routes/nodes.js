@@ -266,6 +266,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
         }
 
         const nodeType = type || 'hysteria';
+        const nodePort = parseInt(port, 10) || 443;
 
         let normalizedPortRange;
         try {
@@ -293,12 +294,12 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             }
         }
 
-        // Ensure no duplicate node for the same IP + protocol type
+        // Independent services on one public host are distinguished by port.
         // (skipped for virtual: it has no IP and the partial unique index excludes it).
         if (nodeType !== 'virtual') {
-            const existing = await HyNode.findOne({ ip, type: nodeType });
+            const existing = await HyNode.findOne({ ip, port: nodePort, type: nodeType });
             if (existing) {
-                return res.status(409).json({ error: `A ${nodeType} node with this IP already exists` });
+                return res.status(409).json({ error: `A ${nodeType} node already exists at ${ip}:${nodePort}` });
             }
         }
 
@@ -323,7 +324,7 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
             type: nodeType,
             domain: domain || '',
             sni: sni || '',
-            port: port || 443,
+            port: nodePort,
             portRange: normalizedPortRange,
             statsHost: typeof statsHost === 'string' ? statsHost.trim() : '',
             statsPort: statsPort || 9999,

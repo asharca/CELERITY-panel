@@ -300,6 +300,7 @@ router.post('/nodes', async (req, res) => {
         const { name } = req.body;
         const nodeType = ['xray', 'virtual'].includes(req.body.type) ? req.body.type : 'hysteria';
         const ip = req.body.ip || '';
+        const nodePort = parseInt(req.body.port, 10) || 443;
 
         if (!name) {
             return res.redirect(`/panel/nodes/add?error=${encodeURIComponent('Name is required')}`);
@@ -308,11 +309,12 @@ router.post('/nodes', async (req, res) => {
             return res.redirect(`/panel/nodes/add?error=${encodeURIComponent('IP address is required')}`);
         }
 
-        // Ensure no duplicate node for the same IP + protocol type (skipped for virtual: no IP).
+        // Independent services on one public host are distinguished by port
+        // (skipped for virtual: no IP).
         if (nodeType !== 'virtual') {
-            const existing = await HyNode.findOne({ ip, type: nodeType });
+            const existing = await HyNode.findOne({ ip, port: nodePort, type: nodeType });
             if (existing) {
-                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(`A ${nodeType} node with this IP already exists`)}`);
+                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(`A ${nodeType} node already exists at ${ip}:${nodePort}`)}`);
             }
         }
 
@@ -358,7 +360,7 @@ router.post('/nodes', async (req, res) => {
             domain: req.body.domain || '',
             sni: req.body.sni || '',
             flag: req.body.flag || '',
-            port: parseInt(req.body.port) || 443,
+            port: nodePort,
             portRange: canonicalizePortRange(req.body.portRange),
             statsHost: typeof req.body.statsHost === 'string' ? req.body.statsHost.trim() : '',
             statsPort: parseInt(req.body.statsPort) || 9999,

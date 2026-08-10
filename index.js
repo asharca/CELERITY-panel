@@ -526,10 +526,11 @@ async function startServer() {
         // have ip=null, so the constraint must still skip non-string values.
         try {
             const indexes = await mongoose.connection.collection('hynodes').indexes();
-            const ipType = indexes.find(idx => idx.name === 'ip_1_type_1');
-            if (ipType) {
-                await mongoose.connection.collection('hynodes').dropIndex('ip_1_type_1');
-                logger.info('[Migration] Dropped legacy ip_1_type_1 endpoint-conflicting index');
+            const legacyEndpointIndexes = ['ip_1_type_1', 'ip_1_type_1_port_1'];
+            for (const name of legacyEndpointIndexes) {
+                if (!indexes.some(idx => idx.name === name)) continue;
+                await mongoose.connection.collection('hynodes').dropIndex(name);
+                logger.info(`[Migration] Dropped legacy ${name} endpoint-conflicting index`);
             }
             await mongoose.connection.collection('hynodes').createIndex(
                 { ip: 1, port: 1, type: 1 },
