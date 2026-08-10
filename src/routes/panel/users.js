@@ -442,12 +442,15 @@ router.get('/users/:userId', async (req, res) => {
         const hwidGlobalMode = settings?.subscription?.happ?.hwid?.mode || 'off';
         const hwidEnabled = hwidGlobalMode === 'permissive' || hwidGlobalMode === 'strict';
 
-        const [hwidDevices, hwidCount] = hwidEnabled
-            ? await Promise.all([
-                hwidDeviceService.listDevices(user.userId),
-                hwidDeviceService.getDeviceCount(user.userId),
-            ])
-            : [[], 0];
+        const [hwidDevices, hwidCount, accessLogNodes] = await Promise.all([
+            hwidEnabled ? hwidDeviceService.listDevices(user.userId) : Promise.resolve([]),
+            hwidEnabled ? hwidDeviceService.getDeviceCount(user.userId) : Promise.resolve(0),
+            HyNode.find({
+                active: { $ne: false },
+                type: { $in: ['xray', 'hysteria'] },
+                cascadeRole: { $in: ['standalone', 'portal'] },
+            }).select('name').lean(),
+        ]);
         const hwidLimit = hwidEnabled ? hwidDeviceService.effectiveDeviceLimit(user.toObject()) : 0;
         
         let effectiveNodes = [];
@@ -465,6 +468,7 @@ router.get('/users/:userId', async (req, res) => {
             user,
             allGroups,
             effectiveNodes,
+            accessLogNodes,
             hwidDevices,
             hwidCount,
             hwidLimit,

@@ -10,8 +10,9 @@
  *   4. marks the batch processed in Redis (short-TTL idempotency for agent
  *      retries) and removes the spool file.
  *
- * The panel does NO per-event parsing: ClickHouse does it. That keeps CPU on the
- * panel proportional to bytes moved, not events, which matters on weak hardware.
+ * ClickHouse handles the full access-line parser. The panel only performs a
+ * bounded HY2 runtime-tag lookup so several Hysteria services on one host can
+ * be attributed to their separate panel nodes before the raw insert.
  *
  * Runs on a timer and can be nudged via kick() right after an ingest so latency
  * stays low without a tight busy loop. A single-flight guard prevents concurrent
@@ -39,10 +40,18 @@ const MAX_INFLATED_BYTES = 64 * 1024 * 1024; // 64 MB
 
 const PROCESS_INTERVAL_MS = 10 * 1000;
 const MAX_FILES_PER_RUN = 50;
+const NODE_MAPPING_TTL_MS = 30 * 1000;
+
+// `hysteria2/<runtime>/session-N` is emitted by cc-agent for tagged journal
+// sources. Old one-runtime agents emit `hysteria2` or `hysteria2/session-N`,
+// which intentionally falls back to the physical ingest node.
+const HYSTERIA_RUNTIME_TAG_RE = /\[\s*hysteria2\/([A-Za-z0-9][A-Za-z0-9_.-]{0,63})(?:\/session-[^\s\]/]+)?\s*->/;
+const MONGO_OBJECT_ID_RE = /^[a-f\d]{24}$/i;
 
 let running = false;
 let timer = null;
 let kickPending = false;
+const runtimeNodeMappings = new Map();
 
 // Serialize storage-changing operations across ingest, drain and admin purge.
 // In particular, purge must wait for an insert that has already read a spool
@@ -80,6 +89,57 @@ async function shouldMaskClientIp() {
 
 function resetMaskCache() {
     _maskCache = { value: false, at: 0 };
+}
+
+function buildRuntimeNodeMap(sources) {
+    const mappings = new Map();
+    for (const source of Array.isArray(sources) ? sources : []) {
+        const tag = String(source?.tag || '').trim();
+        const nodeId = source?.nodeId ? String(source.nodeId).trim() : '';
+        if (tag && MONGO_OBJECT_ID_RE.test(nodeId)) mappings.set(tag, nodeId);
+    }
+    return mappings;
+}
+
+function registerRuntimeNodeMappings(nodeId, sources) {
+    const normalizedNodeId = String(nodeId || '').trim();
+    if (!normalizedNodeId) return new Map();
+    const mappings = buildRuntimeNodeMap(sources);
+    runtimeNodeMappings.set(normalizedNodeId, { at: Date.now(), mappings });
+    return mappings;
+}
+
+async function getRuntimeNodeMappings(nodeId) {
+    const normalizedNodeId = String(nodeId || '').trim();
+    // Spool file names are authenticated on ingest in production, but retain a
+    // no-DB fallback for malformed/legacy test artifacts rather than throwing
+    // a Mongoose ObjectId cast error during an otherwise recoverable drain.
+    if (!MONGO_OBJECT_ID_RE.test(normalizedNodeId)) return new Map();
+    const cached = runtimeNodeMappings.get(normalizedNodeId);
+    if (cached && Date.now() - cached.at < NODE_MAPPING_TTL_MS) return cached.mappings;
+
+    try {
+        const HyNode = require('../../models/hyNodeModel');
+        const node = await HyNode.findById(normalizedNodeId)
+            .select('xray.accessLogs.journalSources')
+            .lean();
+        return registerRuntimeNodeMappings(normalizedNodeId, node?.xray?.accessLogs?.journalSources);
+    } catch (error) {
+        // Attribution must never block durable log delivery. A short-lived
+        // Mongo outage leaves the event on its authenticated physical node.
+        logger.warn(`[AccessLogs] node attribution lookup failed for ${normalizedNodeId}: ${error.message}`);
+        return new Map();
+    }
+}
+
+function resolveRuntimeNodeId(physicalNodeId, raw, mappings) {
+    const match = HYSTERIA_RUNTIME_TAG_RE.exec(String(raw || ''));
+    const mapped = match && mappings?.get(match[1]);
+    return mapped || physicalNodeId;
+}
+
+function resetRuntimeNodeMappings() {
+    runtimeNodeMappings.clear();
 }
 
 /**
@@ -166,7 +226,7 @@ function maskRawLine(raw) {
 // Parse a single spool file into ClickHouse raw rows tagged with the node id.
 // Throws on corrupt gzip OR on decompression past MAX_INFLATED_BYTES (both are
 // treated as an undecodable batch and dropped by the caller).
-async function parseSpoolFile(filePath, mask) {
+async function parseSpoolFile(filePath, mask, runtimeMappings) {
     const { nodeId } = spoolService.parseSpoolName(filePath);
     const gz = await fsp.readFile(filePath);
     const ndjson = (await gunzip(gz, { maxOutputLength: MAX_INFLATED_BYTES })).toString('utf8');
@@ -185,7 +245,7 @@ async function parseSpoolFile(filePath, mask) {
         if (mask) raw = maskRawLine(raw);
         // The agent also sends a file offset per record; it is only used for
         // agent-side resume and is deliberately not stored.
-        rows.push({ node_id: nodeId, raw });
+        rows.push({ node_id: resolveRuntimeNodeId(nodeId, raw, runtimeMappings), raw });
     }
     return { nodeId, rows };
 }
@@ -204,7 +264,8 @@ async function processFile(filePath, mask) {
 
     let parsed;
     try {
-        parsed = await parseSpoolFile(filePath, mask);
+        const runtimeMappings = await getRuntimeNodeMappings(nodeId);
+        parsed = await parseSpoolFile(filePath, mask, runtimeMappings);
     } catch (e) {
         // Undecodable batch (corrupt gzip, etc): drop it so it cannot block the
         // queue. There is no structured content to salvage.
@@ -365,6 +426,10 @@ module.exports = {
     // exported for tests
     maskIp,
     maskRawLine,
+    buildRuntimeNodeMap,
+    registerRuntimeNodeMappings,
+    resolveRuntimeNodeId,
+    resetRuntimeNodeMappings,
     parseSpoolFile,
     processFile,
     resetMaskCache,

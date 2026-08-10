@@ -6,6 +6,11 @@
         .replace(/&/g, '\\u0026')
         .replace(/\u2028/g, '\\u2028')
         .replace(/\u2029/g, '\\u2029');
+    const accessLogNodeNames = (typeof accessLogNodes === 'undefined' ? [] : accessLogNodes)
+        .reduce((names, node) => {
+            if (node?._id) names[String(node._id)] = node.name || String(node._id);
+            return names;
+        }, {});
 %>
 <div class="page-header">
     <a href="/panel/users" class="btn btn-back"><i class="ti ti-chevron-left"></i> <%= t('common.backToList') %></a>
@@ -422,7 +427,7 @@
                         <thead>
                             <tr>
                                 <th scope="col"><%= t('userInsights.columnTime') %></th>
-                                <th scope="col"><%= t('userInsights.columnRoute') %></th>
+                                <th scope="col"><%= t('accessLogs.filterNode') || 'Node' %></th>
                                 <th scope="col"><%= t('userInsights.columnSource') %></th>
                                 <th scope="col"><%= t('userInsights.columnDestination') %></th>
                                 <th scope="col"><%= t('userInsights.columnProtocol') %></th>
@@ -535,6 +540,7 @@ QRCode.toCanvas(document.createElement('canvas'), subUrl, { width: 180, margin: 
 <script>
 window.__USER_INSIGHTS__ = {
     userId: <%- jsonForScript(user.userId) %>,
+    nodeNames: <%- jsonForScript(accessLogNodeNames) %>,
     i18n: {
         loadingTraffic: <%- jsonForScript(t('userInsights.loadingTraffic')) %>,
         loadingAccess: <%- jsonForScript(t('userInsights.loadingAccess')) %>,

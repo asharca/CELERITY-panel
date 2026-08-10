@@ -322,6 +322,13 @@ const xrayConfigSchema = new mongoose.Schema({
             type: [{
                 unit: { type: String, required: true, trim: true, maxlength: 128 },
                 tag: { type: String, required: true, trim: true, maxlength: 64 },
+                // The panel node represented by this runtime. It is intentionally
+                // panel-side metadata: cc-agent receives only unit + tag.
+                nodeId: {
+                    type: mongoose.Schema.Types.ObjectId,
+                    ref: 'HyNode',
+                    default: null,
+                },
             }],
             default: [],
         },

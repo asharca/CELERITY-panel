@@ -114,6 +114,20 @@ assert.deepStrictEqual(
     multiJournalSources,
     'a physical HY2 host can publish several tagged systemd sources'
 );
+const nodeAttributedSources = multiJournalSources.map((source, index) => ({
+    ...source,
+    nodeId: `507f1f77bcf86cd7994390${String(10 + index).padStart(2, '0')}`,
+}));
+assert.deepStrictEqual(
+    provision.normalizeHysteriaJournalSources({ journalSources: nodeAttributedSources }),
+    nodeAttributedSources,
+    'runtime-to-panel-node attribution survives source normalization'
+);
+assert.deepStrictEqual(
+    provision.mergeJournalSourceNodeMappings(nodeAttributedSources, multiJournalSources),
+    nodeAttributedSources,
+    'remote agent reports must not erase panel-only node attribution'
+);
 assert.throws(
     () => provision.normalizeHysteriaJournalSources({
         journalSources: [{ unit: 'hysteria-server' }, { unit: 'hysteria-dev', tag: 'dev' }],

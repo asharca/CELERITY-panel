@@ -31,6 +31,10 @@ assert.match(client, /\/panel\/access-logs\/api\/analytics\?/, 'the account view
 assert.match(client, /\/panel\/access-logs\/api\/search\?/, 'the account view loads recent access events');
 assert.match(client, /email:\s*String\(config\.userId\)/, 'access queries filter by the subscription account');
 assert.match(client, /Date\.now\(\)\s*-\s*\(7\s*\*\s*24/, 'account access summaries are bounded to seven days');
+assert.match(template, /nodeNames:\s*<%- jsonForScript\(accessLogNodeNames\) %>/,
+    'the account view receives a safe node-name lookup');
+assert.match(client, /formatNode\(event\.node_id\)/,
+    'account access rows identify the panel node, not a transport route');
 assert.match(
     client,
     /series\[series\.length\s*-\s*1\]\.ts/,

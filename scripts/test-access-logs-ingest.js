@@ -62,6 +62,32 @@ try { require('mongoose').set('bufferTimeoutMS', 1); } catch (_) { /* mongoose o
     assert.strictEqual(parsed.rows[0].node_id, nodeId, 'row tagged with node id');
     assert.ok(parsed.rows[0].raw.includes('1.2.3.4'), 'raw line preserved');
 
+    // One physical cc-agent can follow several HY2 systemd units. A runtime
+    // tag maps those events to the matching logical panel node before insert;
+    // unknown/legacy tags safely remain on the authenticated physical node.
+    const physicalNodeId = '507f1f77bcf86cd799439010';
+    const mobileNodeId = '507f1f77bcf86cd799439011';
+    const runtimeMap = processService.buildRuntimeNodeMap([
+        { tag: 'mobile', nodeId: mobileNodeId },
+        { tag: 'bad-node-id', nodeId: 'not-an-object-id' },
+    ]);
+    const mobileHy2Line = '2026/08/11 12:00:00 203.0.113.5:5000 accepted udp:dns.example:53 [hysteria2/mobile/session-7 -> direct] email: user@x';
+    assert.strictEqual(
+        processService.resolveRuntimeNodeId(physicalNodeId, mobileHy2Line, runtimeMap),
+        mobileNodeId,
+        'a tagged HY2 record is attributed to its mapped panel node'
+    );
+    assert.strictEqual(
+        processService.resolveRuntimeNodeId(physicalNodeId, mobileHy2Line.replace('/mobile', '/unknown'), runtimeMap),
+        physicalNodeId,
+        'unknown runtime tags cannot claim an arbitrary panel node'
+    );
+    assert.strictEqual(
+        processService.resolveRuntimeNodeId(physicalNodeId, line, runtimeMap),
+        physicalNodeId,
+        'Xray and legacy records retain their authenticated physical node'
+    );
+
     // IP masking primitives: IPv4 keeps /24, IPv6 keeps three hextets.
     assert.strictEqual(processService.maskIp('192.168.1.33'), '192.168.1.0', 'IPv4 masked to /24');
     assert.strictEqual(processService.maskIp('2001:db8:abcd:12:34::1'), '2001:db8:abcd::', 'IPv6 masked');

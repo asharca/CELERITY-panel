@@ -63,6 +63,15 @@ const cred = require('../src/services/accessLogs/credentialService');
 
     const path = HyNode.schema.path('xray');
     assert.ok(path, 'xray subdocument path exists');
+
+    n.xray.accessLogs.journalSources = [{
+        unit: 'hysteria-server@mobile',
+        tag: 'mobile',
+        nodeId: '507f1f77bcf86cd799439011',
+    }];
+    assert.strictEqual(n.validateSync(), undefined,
+        'a journal source can persist its logical panel-node attribution');
+    assert.strictEqual(String(n.xray.accessLogs.journalSources[0].nodeId), '507f1f77bcf86cd799439011');
 }
 
 (async () => {

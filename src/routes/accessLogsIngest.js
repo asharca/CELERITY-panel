@@ -138,6 +138,12 @@ router.post('/ingest', async (req, res) => {
         }
 
         const processService = require('../services/accessLogs/processService');
+        // Keep the authenticated physical node's runtime -> logical-node map
+        // hot for the drain that follows. A restart still falls back to Mongo.
+        processService.registerRuntimeNodeMappings(
+            nodeId,
+            node.xray?.accessLogs?.journalSources
+        );
         await processService.withStorageLock(async () => {
             await spoolService.persistBatch(nodeId, batchId, body);
             await bumpStats({ ingestedBatches: 1, lastIngestAt: new Date() });

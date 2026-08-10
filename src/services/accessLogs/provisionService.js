@@ -124,10 +124,14 @@ function normalizeHysteriaJournalSources(accessLogs = {}) {
         accessLogs?.journalUnit || require('../configGenerator').HYSTERIA_SYSTEMD_UNIT
     ).trim();
     const sources = configured.length > 0
-        ? configured.map(source => ({
-            unit: String(source?.unit || '').trim(),
-            tag: String(source?.tag || '').trim(),
-        }))
+        ? configured.map(source => {
+            const normalized = {
+                unit: String(source?.unit || '').trim(),
+                tag: String(source?.tag || '').trim(),
+            };
+            if (source?.nodeId) normalized.nodeId = String(source.nodeId).trim();
+            return normalized;
+        })
         : [{ unit: fallbackUnit, tag: '' }];
     const seenUnits = new Set();
     const seenTags = new Set();
@@ -151,6 +155,27 @@ function normalizeHysteriaJournalSources(accessLogs = {}) {
         if (source.tag) seenTags.add(source.tag);
     }
     return sources;
+}
+
+// cc-agent reports only its runtime/unit fields after a successful remote
+// reconcile. Preserve the panel-only source -> node attribution while adopting
+// the runtime's canonical source list.
+function mergeJournalSourceNodeMappings(configured, reported) {
+    const byRuntime = new Map();
+    for (const source of Array.isArray(configured) ? configured : []) {
+        const nodeId = source?.nodeId ? String(source.nodeId).trim() : '';
+        if (!nodeId) continue;
+        byRuntime.set(`${String(source?.unit || '')}\u0000${String(source?.tag || '')}`, nodeId);
+    }
+    return (Array.isArray(reported) ? reported : []).map(source => {
+        const normalized = {
+            unit: String(source?.unit || '').trim(),
+            tag: String(source?.tag || '').trim(),
+        };
+        const nodeId = byRuntime.get(`${String(source?.unit || '')}\u0000${String(source?.tag || '')}`);
+        if (nodeId) normalized.nodeId = nodeId;
+        return normalized;
+    });
 }
 
 function journalSourceStatusMatches(status, expected) {
@@ -271,7 +296,9 @@ function desiredFingerprint(shouldShip, settings, tokenHash, node) {
         .update('|')
         .update(String(source.journalUnit))
         .update('|')
-        .update(JSON.stringify(source.journalSources || []))
+        // nodeId is panel-only attribution metadata. Changing it must not
+        // restart Hysteria/cc-agent because the remote agent never consumes it.
+        .update(JSON.stringify((source.journalSources || []).map(({ unit, tag }) => ({ unit, tag }))))
         .update('|')
         .update(String(source.path))
         .digest('hex')
@@ -1015,14 +1042,19 @@ async function reconcileNode(node, settings, options = {}) {
                 if (result?.journalUnit) {
                     fresh.xray.accessLogs.journalUnit = result.journalUnit;
                     if (Array.isArray(result.journalSources) && result.journalSources.length > 0) {
-                        fresh.xray.accessLogs.journalSources = result.journalSources;
+                        fresh.xray.accessLogs.journalSources = mergeJournalSourceNodeMappings(
+                            fresh.xray.accessLogs.journalSources,
+                            result.journalSources
+                        );
                     }
                     fingerprint = desiredFingerprint(shouldShip, settings, tokenHash, fresh);
                     await HyNode.updateOne({ _id: node._id }, {
                         $set: {
                             'xray.accessLogs.journalUnit': result.journalUnit,
                             ...(Array.isArray(result.journalSources) && result.journalSources.length > 0
-                                ? { 'xray.accessLogs.journalSources': result.journalSources }
+                                ? {
+                                    'xray.accessLogs.journalSources': fresh.xray.accessLogs.journalSources,
+                                }
                                 : {}),
                         },
                     });
@@ -1289,6 +1321,7 @@ module.exports = {
     resolveIngestUrl,
     isEligibleNode,
     normalizeHysteriaJournalSources,
+    mergeJournalSourceNodeMappings,
     journalSourceStatusMatches,
     accessLogSourceForNode,
     buildHysteriaTeardownNode,
