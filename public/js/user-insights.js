@@ -21,10 +21,12 @@
     let accessLoading = false;
     let accessLoaded = false;
     let resizeFrame = 0;
+    let chartInteraction = null;
 
     const $ = (id) => document.getElementById(id);
     const numberFormatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 });
     const decimalFormatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
+    const percentFormatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 });
 
     function finiteNumber(value) {
         const number = Number(value);
@@ -45,6 +47,10 @@
         }
         const formatted = unit === 0 ? numberFormatter.format(bytes) : decimalFormatter.format(bytes);
         return formatted + ' ' + units[unit];
+    }
+
+    function formatPercent(value) {
+        return percentFormatter.format(finiteNumber(value));
     }
 
     function formatAxisBytes(value) {
@@ -133,6 +139,15 @@
         }).format(date);
     }
 
+    function rangeLabel(range) {
+        const labels = {
+            '24h': I18N.range24Hours,
+            '7d': I18N.range7Days,
+            '30d': I18N.range30Days,
+        };
+        return labels[range] || range;
+    }
+
     function setTrafficState(state) {
         const loading = state === 'loading';
         $('trafficSkeleton').hidden = !loading;
@@ -170,7 +185,7 @@
         const rawTotals = (payload && payload.totals) || {};
         const tx = finiteNumber(rawTotals.tx);
         const rx = finiteNumber(rawTotals.rx);
-        const total = rawTotals.total == null ? tx + rx : finiteNumber(rawTotals.total);
+        const total = tx + rx;
         const series = Array.isArray(payload && payload.series) ? payload.series.map((point) => {
             const pointTx = finiteNumber(point && point.tx);
             const pointRx = finiteNumber(point && point.rx);
@@ -178,7 +193,7 @@
                 ts: point && point.ts,
                 tx: pointTx,
                 rx: pointRx,
-                total: point && point.total == null ? pointTx + pointRx : finiteNumber(point.total),
+                total: pointTx + pointRx,
             };
         }).sort((a, b) => {
             const aDate = parseTimestamp(a.ts);
@@ -194,7 +209,7 @@
                 nodeType: String((node && node.nodeType) || ''),
                 tx: nodeTx,
                 rx: nodeRx,
-                total: node && node.total == null ? nodeTx + nodeRx : finiteNumber(node.total),
+                total: nodeTx + nodeRx,
             };
         }).sort((a, b) => b.total - a.total) : [];
 
@@ -245,6 +260,20 @@
         }
     }
 
+    function completedTrafficSummary(data) {
+        const allPoints = Array.isArray(data.series) ? data.series : [];
+        const completed = allPoints.length > 1 ? allPoints.slice(0, -1) : allPoints;
+        const total = completed.reduce((sum, point) => sum + finiteNumber(point.total), 0);
+        const peak = completed.reduce((current, point) => (
+            !current || finiteNumber(point.total) > finiteNumber(current.total) ? point : current
+        ), null);
+
+        return {
+            average: completed.length ? total / completed.length : 0,
+            peak,
+        };
+    }
+
     function renderTraffic(data) {
         activeTraffic = data;
         selectRange(data.range);
@@ -252,8 +281,29 @@
         $('trafficTotal').textContent = formatBytes(data.totals.total);
         $('trafficTx').textContent = formatBytes(data.totals.tx);
         $('trafficRx').textContent = formatBytes(data.totals.rx);
-        $('trafficGranularity').textContent = data.granularity === 'day'
+        const granularityLabel = data.granularity === 'day'
             ? (I18N.daily || '') : (I18N.hourly || '');
+        $('trafficGranularity').textContent = [granularityLabel, I18N.currentBucketHint]
+            .filter(Boolean).join(' · ');
+
+        const total = data.totals.total;
+        const txShare = total > 0 ? (data.totals.tx / total) * 100 : 0;
+        const rxShare = total > 0 ? (data.totals.rx / total) * 100 : 0;
+        const completed = completedTrafficSummary(data);
+        const averageTemplate = data.granularity === 'day' ? I18N.averageDaily : I18N.averageHourly;
+        $('trafficAverage').textContent = interpolate(averageTemplate, {
+            value: formatBytes(completed.average),
+        });
+        $('trafficTxShare').textContent = interpolate(I18N.shareOfPeriod, {
+            percent: formatPercent(txShare),
+        });
+        $('trafficRxShare').textContent = interpolate(I18N.shareOfPeriod, {
+            percent: formatPercent(rxShare),
+        });
+        $('trafficPeak').textContent = completed.peak ? formatBytes(completed.peak.total) : '—';
+        $('trafficPeakTime').textContent = completed.peak && completed.peak.total > 0
+            ? formatChartDetailTime(completed.peak.ts, data.granularity)
+            : '—';
 
         const period = interpolate(I18N.currentPeriod, {
             from: formatPeriodDate(data.from, data.range),
@@ -273,6 +323,7 @@
         } else {
             $('trafficChart').replaceChildren();
             $('trafficNodes').replaceChildren();
+            hideChartSelection();
         }
         announce(I18N.trafficLoaded);
     }
@@ -284,23 +335,6 @@
         return element;
     }
 
-    function linePath(points, key, width, height, padding, maxValue) {
-        const plotWidth = width - padding.left - padding.right;
-        const plotHeight = height - padding.top - padding.bottom;
-        return points.map((point, index) => {
-            const x = points.length === 1
-                ? padding.left + plotWidth / 2
-                : padding.left + (index / (points.length - 1)) * plotWidth;
-            const y = padding.top + plotHeight - (finiteNumber(point[key]) / maxValue) * plotHeight;
-            return { x, y };
-        });
-    }
-
-    function pointsToPath(points) {
-        return points.map((point, index) => (index ? 'L' : 'M')
-            + point.x.toFixed(2) + ' ' + point.y.toFixed(2)).join(' ');
-    }
-
     function formatChartTime(value, granularity) {
         const date = parseTimestamp(value);
         if (!date) return '—';
@@ -310,8 +344,19 @@
         return new Intl.DateTimeFormat(locale, options).format(date);
     }
 
+    function formatChartDetailTime(value, granularity) {
+        const date = parseTimestamp(value);
+        if (!date) return '—';
+        const options = granularity === 'day'
+            ? { year: 'numeric', month: 'short', day: 'numeric' }
+            : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+        return new Intl.DateTimeFormat(locale, options).format(date);
+    }
+
     function renderTrafficChart(data) {
         const container = $('trafficChart');
+        hideChartSelection();
+        chartInteraction = null;
         const validSeries = data.series.filter((point) => parseTimestamp(point.ts));
         const noPoints = validSeries.length === 0;
         container.hidden = noPoints;
@@ -319,34 +364,32 @@
         container.replaceChildren();
         if (noPoints) return;
 
-        const width = Math.max(300, Math.floor(container.clientWidth || 720));
-        const height = width < 480 ? 220 : 250;
-        const padding = { top: 14, right: 14, bottom: 34, left: width < 420 ? 46 : 54 };
-        const maxValue = Math.max(1, ...validSeries.flatMap((point) => [point.tx, point.rx]));
-        const txPoints = linePath(validSeries, 'tx', width, height, padding, maxValue);
-        const rxPoints = linePath(validSeries, 'rx', width, height, padding, maxValue);
+        const width = Math.max(220, Math.floor(container.clientWidth || 720));
+        const height = width < 480 ? 230 : 260;
+        const padding = { top: 18, right: 10, bottom: 36, left: width < 420 ? 44 : 54 };
+        const plotWidth = width - padding.left - padding.right;
+        const plotHeight = height - padding.top - padding.bottom;
+        const maxValue = Math.max(1, ...validSeries.map((point) => point.total));
         const baseline = height - padding.bottom;
+        const slot = plotWidth / validSeries.length;
+        const barWidth = Math.max(3, Math.min(18, slot * 0.68));
+        const baseLabel = interpolate(I18N.chartAria, {
+            range: rangeLabel(data.range),
+            tx: formatBytes(data.totals.tx),
+            rx: formatBytes(data.totals.rx),
+            total: formatBytes(data.totals.total),
+        });
 
         const svg = svgElement('svg', {
             viewBox: '0 0 ' + width + ' ' + height,
             width: '100%', height,
-            role: 'img',
-            'aria-label': interpolate(I18N.chartAria, {
-                range: data.range,
-                tx: formatBytes(data.totals.tx),
-                rx: formatBytes(data.totals.rx),
-                total: formatBytes(data.totals.total),
-            }),
+            'aria-hidden': 'true',
+            focusable: 'false',
         });
-        svg.appendChild(svgElement('title', {}, interpolate(I18N.chartAria, {
-            range: data.range,
-            tx: formatBytes(data.totals.tx),
-            rx: formatBytes(data.totals.rx),
-            total: formatBytes(data.totals.total),
-        })));
+        container.setAttribute('aria-label', baseLabel);
 
         [0, 0.5, 1].forEach((fraction) => {
-            const y = padding.top + (1 - fraction) * (height - padding.top - padding.bottom);
+            const y = padding.top + (1 - fraction) * plotHeight;
             svg.appendChild(svgElement('line', {
                 x1: padding.left, x2: width - padding.right, y1: y, y2: y,
                 class: 'traffic-chart-gridline',
@@ -357,47 +400,203 @@
             }, formatAxisBytes(maxValue * fraction)));
         });
 
+        const selection = svgElement('rect', {
+            x: padding.left,
+            y: padding.top,
+            width: slot,
+            height: plotHeight,
+            rx: 4,
+            class: 'traffic-chart-selection',
+        });
+        selection.hidden = true;
+        svg.appendChild(selection);
+
+        const bars = [];
+        const geometry = [];
+        validSeries.forEach((point, index) => {
+            const center = padding.left + (slot * index) + (slot / 2);
+            const x = center - (barWidth / 2);
+            const rxHeight = (point.rx / maxValue) * plotHeight;
+            const txHeight = (point.tx / maxValue) * plotHeight;
+            const totalHeight = rxHeight + txHeight;
+            const group = svgElement('g', {
+                class: 'traffic-chart-bar-group' + (index === validSeries.length - 1 ? ' is-current' : ''),
+            });
+
+            if (point.rx > 0) {
+                group.appendChild(svgElement('rect', {
+                    x, y: baseline - rxHeight, width: barWidth, height: Math.max(1, rxHeight),
+                    rx: Math.min(3, barWidth / 3),
+                    class: 'traffic-chart-bar traffic-chart-bar-rx',
+                }));
+            }
+            if (point.tx > 0) {
+                group.appendChild(svgElement('rect', {
+                    x, y: baseline - totalHeight, width: barWidth, height: Math.max(1, txHeight),
+                    rx: Math.min(3, barWidth / 3),
+                    class: 'traffic-chart-bar traffic-chart-bar-tx',
+                }));
+            }
+
+            bars.push(group);
+            geometry.push({
+                center,
+                top: baseline - Math.max(1, totalHeight),
+                slotX: padding.left + (slot * index),
+            });
+            svg.appendChild(group);
+        });
+
+        const completedCount = Math.max(1, validSeries.length - 1);
+        let peakIndex = 0;
+        for (let index = 1; index < completedCount; index += 1) {
+            if (validSeries[index].total > validSeries[peakIndex].total) peakIndex = index;
+        }
+        if (validSeries[peakIndex].total > 0) {
+            svg.appendChild(svgElement('circle', {
+                cx: geometry[peakIndex].center,
+                cy: Math.max(padding.top + 3, geometry[peakIndex].top - 5),
+                r: 2.5,
+                class: 'traffic-chart-peak',
+            }));
+        }
+
         const lastIndex = validSeries.length - 1;
-        const tickIndexes = Array.from(new Set([0, Math.round(lastIndex / 3), Math.round(lastIndex * 2 / 3), lastIndex]));
+        const tickIndexes = width < 420
+            ? Array.from(new Set([0, Math.round(lastIndex / 2), lastIndex]))
+            : Array.from(new Set([0, Math.round(lastIndex / 3), Math.round(lastIndex * 2 / 3), lastIndex]));
         tickIndexes.forEach((index) => {
-            const point = txPoints[index];
             const anchor = index === 0 ? 'start' : (index === lastIndex ? 'end' : 'middle');
             svg.appendChild(svgElement('text', {
-                x: point.x, y: height - 9,
+                x: geometry[index].center, y: height - 9,
                 class: 'traffic-chart-axis-label', 'text-anchor': anchor,
             }, formatChartTime(validSeries[index].ts, data.granularity)));
         });
 
-        [
-            { points: rxPoints, className: 'traffic-chart-area traffic-chart-area-rx' },
-            { points: txPoints, className: 'traffic-chart-area traffic-chart-area-tx' },
-        ].forEach((entry) => {
-            const areaPath = pointsToPath(entry.points)
-                + ' L' + entry.points[entry.points.length - 1].x.toFixed(2) + ' ' + baseline
-                + ' L' + entry.points[0].x.toFixed(2) + ' ' + baseline + ' Z';
-            svg.appendChild(svgElement('path', { d: areaPath, class: entry.className }));
-        });
-
-        svg.appendChild(svgElement('path', {
-            d: pointsToPath(rxPoints), class: 'traffic-chart-line traffic-chart-line-rx',
-            'vector-effect': 'non-scaling-stroke',
-        }));
-        svg.appendChild(svgElement('path', {
-            d: pointsToPath(txPoints), class: 'traffic-chart-line traffic-chart-line-tx',
-            'vector-effect': 'non-scaling-stroke',
-        }));
-
-        [
-            { point: rxPoints[rxPoints.length - 1], className: 'traffic-chart-point traffic-chart-point-rx' },
-            { point: txPoints[txPoints.length - 1], className: 'traffic-chart-point traffic-chart-point-tx' },
-        ].forEach((entry) => {
-            svg.appendChild(svgElement('circle', {
-                cx: entry.point.x, cy: entry.point.y, r: 3.5, class: entry.className,
-                'vector-effect': 'non-scaling-stroke',
-            }));
-        });
-
         container.appendChild(svg);
+        chartInteraction = {
+            container,
+            data,
+            points: validSeries,
+            bars,
+            geometry,
+            selection,
+            width,
+            padding,
+            slot,
+            baseLabel,
+            selectedIndex: null,
+        };
+    }
+
+    function pointAriaLabel(point, data) {
+        return interpolate(I18N.chartPointAria, {
+            time: formatChartDetailTime(point.ts, data.granularity),
+            total: formatBytes(point.total),
+            tx: formatBytes(point.tx),
+            rx: formatBytes(point.rx),
+        });
+    }
+
+    function updateChartSelection(index, options) {
+        const state = chartInteraction;
+        if (!state || !state.points.length) return;
+        const nextIndex = Math.max(0, Math.min(state.points.length - 1, index));
+        const point = state.points[nextIndex];
+        const position = state.geometry[nextIndex];
+        const tooltip = $('trafficChartTooltip');
+
+        state.selectedIndex = nextIndex;
+        state.bars.forEach((bar, barIndex) => bar.classList.toggle('is-selected', barIndex === nextIndex));
+        state.selection.hidden = false;
+        state.selection.setAttribute('x', position.slotX.toFixed(2));
+        state.selection.setAttribute('width', state.slot.toFixed(2));
+
+        $('trafficTooltipTime').textContent = formatChartDetailTime(point.ts, state.data.granularity);
+        $('trafficTooltipTotal').textContent = formatBytes(point.total);
+        $('trafficTooltipTx').textContent = formatBytes(point.tx);
+        $('trafficTooltipRx').textContent = formatBytes(point.rx);
+        tooltip.style.left = ((position.center / state.width) * 100).toFixed(2) + '%';
+        tooltip.style.top = Math.max(state.padding.top + 2, position.top - 8).toFixed(2) + 'px';
+        tooltip.dataset.align = position.center < state.width * 0.25
+            ? 'start' : (position.center > state.width * 0.75 ? 'end' : 'center');
+        tooltip.dataset.side = position.top < 90 ? 'bottom' : 'top';
+        if (tooltip.dataset.side === 'bottom') {
+            tooltip.style.top = (position.top + 10).toFixed(2) + 'px';
+        }
+        tooltip.hidden = false;
+        tooltip.setAttribute('aria-hidden', 'false');
+
+        const label = pointAriaLabel(point, state.data);
+        state.container.setAttribute('aria-label', label);
+        if (options && options.announce) announce(label);
+    }
+
+    function hideChartSelection() {
+        const state = chartInteraction;
+        const tooltip = $('trafficChartTooltip');
+        if (tooltip) {
+            tooltip.hidden = true;
+            tooltip.setAttribute('aria-hidden', 'true');
+        }
+        if (!state) return;
+        state.selectedIndex = null;
+        state.selection.hidden = true;
+        state.bars.forEach((bar) => bar.classList.remove('is-selected'));
+        state.container.setAttribute('aria-label', state.baseLabel);
+    }
+
+    function chartIndexFromPointer(event) {
+        const state = chartInteraction;
+        if (!state) return null;
+        const rect = state.container.getBoundingClientRect();
+        if (!rect.width) return null;
+        const localX = ((event.clientX - rect.left) / rect.width) * state.width;
+        const index = Math.floor((localX - state.padding.left) / state.slot);
+        return Math.max(0, Math.min(state.points.length - 1, index));
+    }
+
+    function bindChartInteractions() {
+        const container = $('trafficChart');
+        container.addEventListener('pointermove', (event) => {
+            if (event.pointerType === 'touch') return;
+            const index = chartIndexFromPointer(event);
+            if (index != null) updateChartSelection(index);
+        });
+        container.addEventListener('pointerleave', () => {
+            if (document.activeElement !== container) hideChartSelection();
+        });
+        container.addEventListener('pointerdown', (event) => {
+            const index = chartIndexFromPointer(event);
+            if (index == null) return;
+            updateChartSelection(index);
+            container.focus({ preventScroll: true });
+        });
+        container.addEventListener('focus', () => {
+            if (!chartInteraction) return;
+            const index = chartInteraction.selectedIndex == null
+                ? chartInteraction.points.length - 1
+                : chartInteraction.selectedIndex;
+            updateChartSelection(index);
+        });
+        container.addEventListener('blur', hideChartSelection);
+        container.addEventListener('keydown', (event) => {
+            const state = chartInteraction;
+            if (!state) return;
+            const current = state.selectedIndex == null ? state.points.length - 1 : state.selectedIndex;
+            let next = null;
+            if (event.key === 'ArrowLeft') next = current - 1;
+            if (event.key === 'ArrowRight') next = current + 1;
+            if (event.key === 'Home') next = 0;
+            if (event.key === 'End') next = state.points.length - 1;
+            if (event.key === 'Escape') {
+                hideChartSelection();
+                return;
+            }
+            if (next == null) return;
+            event.preventDefault();
+            updateChartSelection(next, { announce: true });
+        });
     }
 
     function renderTrafficNodes(nodes) {
@@ -408,7 +607,7 @@
         $('trafficNodesEmpty').hidden = activeNodes.length > 0;
         if (!activeNodes.length) return;
 
-        const maximum = Math.max(1, ...activeNodes.map((node) => node.total));
+        const attributedTotal = Math.max(1, activeNodes.reduce((sum, node) => sum + node.total, 0));
         activeNodes.forEach((node) => {
             const row = document.createElement('div');
             row.className = 'traffic-node';
@@ -419,6 +618,7 @@
             identity.className = 'traffic-node-identity';
             const name = document.createElement('strong');
             name.textContent = node.nodeName;
+            name.title = node.nodeName;
             identity.appendChild(name);
             if (node.nodeType) {
                 const type = document.createElement('small');
@@ -427,7 +627,12 @@
             }
             const total = document.createElement('span');
             total.className = 'traffic-node-total';
-            total.textContent = formatBytes(node.total);
+            const amount = document.createElement('strong');
+            amount.textContent = formatBytes(node.total);
+            const share = document.createElement('small');
+            const sharePercent = (node.total / attributedTotal) * 100;
+            share.textContent = interpolate(I18N.nodeShare, { percent: formatPercent(sharePercent) });
+            total.append(amount, share);
             header.append(identity, total);
 
             const track = document.createElement('div');
@@ -441,7 +646,7 @@
             }));
             const fill = document.createElement('span');
             fill.className = 'traffic-node-fill';
-            fill.style.width = ((node.total / maximum) * 100).toFixed(2) + '%';
+            fill.style.width = Math.min(100, sharePercent).toFixed(2) + '%';
             const tx = document.createElement('i');
             tx.className = 'traffic-node-segment traffic-node-segment-tx';
             tx.style.width = ((node.tx / Math.max(1, node.total)) * 100).toFixed(2) + '%';
@@ -627,5 +832,6 @@
         }, { passive: true });
     }
 
+    bindChartInteractions();
     loadTraffic(activeRange);
 })();

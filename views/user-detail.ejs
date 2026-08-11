@@ -11,12 +11,45 @@
             if (node?._id) names[String(node._id)] = node.name || String(node._id);
             return names;
         }, {});
+    const finiteTrafficCount = (value) => {
+        const count = Number(value);
+        return Number.isFinite(count) ? Math.max(0, count) : 0;
+    };
+    const accountTrafficTx = finiteTrafficCount(user.traffic?.tx);
+    const accountTrafficRx = finiteTrafficCount(user.traffic?.rx);
+    const accountTrafficUsed = accountTrafficTx + accountTrafficRx;
+    const accountTrafficLimit = finiteTrafficCount(user.trafficLimit);
+    const accountTrafficRemaining = Math.max(0, accountTrafficLimit - accountTrafficUsed);
+    const accountTrafficPercent = accountTrafficLimit > 0
+        ? (accountTrafficUsed / accountTrafficLimit) * 100
+        : null;
+    const accountTrafficProgress = accountTrafficPercent === null
+        ? 0
+        : (accountTrafficPercent < 100
+            ? Math.min(99.99, Math.floor(accountTrafficPercent * 100) / 100)
+            : 100);
+    const accountTrafficPercentRounded = accountTrafficPercent === null
+        ? null
+        : Math.round(accountTrafficPercent * 10) / 10;
+    const accountTrafficPercentDisplay = accountTrafficPercent === null
+        ? null
+        : (accountTrafficPercent < 100
+            ? Math.floor(accountTrafficPercent * 10) / 10
+            : (accountTrafficPercent > 100 && accountTrafficPercentRounded <= 100
+                ? 100.1
+                : accountTrafficPercentRounded));
+    const accountTrafficPercentLabel = accountTrafficPercentDisplay === null
+        ? ''
+        : `${new Intl.NumberFormat(viewDateLocale, { maximumFractionDigits: 1 }).format(accountTrafficPercentDisplay)}%`;
+    const accountTrafficState = accountTrafficPercent === null
+        ? 'unlimited'
+        : (accountTrafficPercent >= 100 ? 'danger' : (accountTrafficPercent >= 80 ? 'warning' : 'normal'));
 %>
 <div class="page-header">
     <a href="/panel/users" class="btn btn-back"><i class="ti ti-chevron-left"></i> <%= t('common.backToList') %></a>
 </div>
 
-<div class="row">
+<div class="row user-detail-layout">
     <div class="col-8">
         <div class="card">
             <div class="card-header">
@@ -58,12 +91,6 @@
                 <h3 class="section-title"><%= t('users.limits') %></h3>
                 <div class="detail-grid">
                     <div class="detail-item">
-                        <label><%= t('users.traffic') %></label>
-                        <% const usedBytes = (user.traffic?.tx || 0) + (user.traffic?.rx || 0); %>
-                        <% const limitBytes = user.trafficLimit || 0; %>
-                        <span class="value"><%= formatTraffic(usedBytes, { decimals: 2 }) %> / <%= limitBytes > 0 ? formatTraffic(limitBytes, { decimals: 0 }) : '∞' %></span>
-                    </div>
-                    <div class="detail-item">
                         <label><%= t('users.devices') %></label>
                         <% 
                             let deviceLimit = user.maxDevices;
@@ -81,13 +108,6 @@
                         <span class="value"><%= deviceLimitStr %></span>
                     </div>
                     <div class="detail-item">
-                        <label><%= t('users.txRx') %></label>
-                        <span class="value">
-                            <i class="ti ti-arrow-up" style="color:var(--success)"></i> <%= formatTraffic(user.traffic?.tx || 0, { decimals: 2 }) %> / 
-                            <i class="ti ti-arrow-down" style="color:var(--info)"></i> <%= formatTraffic(user.traffic?.rx || 0, { decimals: 2 }) %>
-                        </span>
-                    </div>
-                    <div class="detail-item">
                         <label><%= t('users.createdAt') %></label>
                         <span class="value"><%= user.createdAt ? new Date(user.createdAt).toLocaleString(viewDateLocale, { dateStyle: 'medium', timeStyle: 'short' }) : '—' %></span>
                     </div>
@@ -96,6 +116,62 @@
                         <span class="value"><%= user.expireAt ? new Date(user.expireAt).toLocaleString(viewDateLocale, { dateStyle: 'medium', timeStyle: 'short' }) : t('users.forever') %></span>
                     </div>
                 </div>
+
+                <section class="traffic-quota traffic-quota-<%= accountTrafficState %>"
+                         aria-label="<%= t('userInsights.currentQuota') %>">
+                    <div class="traffic-quota-copy">
+                        <span class="traffic-quota-label">
+                            <i class="ti ti-gauge" aria-hidden="true"></i>
+                            <%= t('userInsights.currentQuota') %>
+                        </span>
+                        <div class="traffic-quota-value">
+                            <strong><%= formatTraffic(accountTrafficUsed, { decimals: 2 }) %></strong>
+                            <span>
+                                <% if (accountTrafficLimit > 0) { %>
+                                    <%= t('common.of') %> <%= formatTraffic(accountTrafficLimit, { decimals: 0 }) %>
+                                <% } else { %>
+                                    · <%= t('common.unlimited') %>
+                                <% } %>
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="traffic-quota-status">
+                        <% if (accountTrafficLimit > 0) { %>
+                            <div class="traffic-quota-meta">
+                                <span><%= t('userInsights.remainingQuota') %> <strong><%= formatTraffic(accountTrafficRemaining, { decimals: 2 }) %></strong></span>
+                                <strong><%= accountTrafficPercentLabel %></strong>
+                            </div>
+                            <div class="traffic-quota-track" role="progressbar"
+                                 aria-label="<%= t('userInsights.quotaUsage') %>"
+                                 aria-valuemin="0" aria-valuemax="100"
+                                 aria-valuenow="<%= accountTrafficProgress.toFixed(2) %>"
+                                 aria-valuetext="<%= accountTrafficPercentLabel %>">
+                                <span style="width: <%= accountTrafficProgress.toFixed(2) %>%"></span>
+                            </div>
+                            <p><%= accountTrafficPercent >= 100 ? t('userInsights.quotaReached') : t('userInsights.quotaCounterHint') %></p>
+                        <% } else { %>
+                            <div class="traffic-quota-unlimited">
+                                <i class="ti ti-infinity" aria-hidden="true"></i>
+                                <div>
+                                    <strong><%= t('userInsights.unlimitedQuota') %></strong>
+                                    <span><%= t('userInsights.unlimitedQuotaHint') %></span>
+                                </div>
+                            </div>
+                        <% } %>
+                    </div>
+
+                    <dl class="traffic-current-split" aria-label="<%= t('userInsights.currentCounterSplit') %>">
+                        <div>
+                            <dt><span class="metric-dot metric-dot-tx" aria-hidden="true"></span><%= t('userInsights.uploaded') %></dt>
+                            <dd><%= formatTraffic(accountTrafficTx, { decimals: 2 }) %></dd>
+                        </div>
+                        <div>
+                            <dt><span class="metric-dot metric-dot-rx" aria-hidden="true"></span><%= t('userInsights.downloaded') %></dt>
+                            <dd><%= formatTraffic(accountTrafficRx, { decimals: 2 }) %></dd>
+                        </div>
+                    </dl>
+                </section>
                 
                 <% if (typeof hwidEnabled !== 'undefined' && hwidEnabled) { %>
                 <h3 class="section-title"><%= t('users.hwidDevices') %></h3>
@@ -249,19 +325,20 @@
          aria-labelledby="userTrafficTab" aria-busy="true">
         <div class="user-insights-toolbar">
             <div class="user-insights-context">
-                <h3><%= t('userInsights.trendTitle') %></h3>
+                <h3><%= t('userInsights.trafficOverviewTitle') %></h3>
                 <p id="trafficPeriod"><%= t('userInsights.loadingTraffic') %></p>
             </div>
             <div class="traffic-range" role="group" aria-label="<%= t('userInsights.rangeLabel') %>">
-                <button type="button" class="traffic-range-btn" data-range="24h" aria-pressed="false">24h</button>
-                <button type="button" class="traffic-range-btn active" data-range="7d" aria-pressed="true">7d</button>
-                <button type="button" class="traffic-range-btn" data-range="30d" aria-pressed="false">30d</button>
+                <button type="button" class="traffic-range-btn" data-range="24h" aria-label="<%= t('userInsights.range24Hours') %>" aria-pressed="false">24h</button>
+                <button type="button" class="traffic-range-btn active" data-range="7d" aria-label="<%= t('userInsights.range7Days') %>" aria-pressed="true">7d</button>
+                <button type="button" class="traffic-range-btn" data-range="30d" aria-label="<%= t('userInsights.range30Days') %>" aria-pressed="false">30d</button>
             </div>
         </div>
 
         <div class="user-insights-skeleton" id="trafficSkeleton" aria-hidden="true">
-            <div class="insights-metrics insights-metrics-skeleton">
-                <span class="ui-skeleton"></span><span class="ui-skeleton"></span><span class="ui-skeleton"></span>
+            <div class="insights-metrics insights-metrics-skeleton traffic-period-metrics">
+                <span class="ui-skeleton"></span><span class="ui-skeleton"></span>
+                <span class="ui-skeleton"></span><span class="ui-skeleton"></span>
             </div>
             <div class="insights-skeleton-grid">
                 <span class="ui-skeleton ui-skeleton-chart"></span>
@@ -281,18 +358,26 @@
         </div>
 
         <div id="trafficContent" hidden>
-            <dl class="insights-metrics" aria-label="<%= t('userInsights.periodSummary') %>">
+            <dl class="insights-metrics traffic-period-metrics" aria-label="<%= t('userInsights.periodSummary') %>">
                 <div class="insights-metric insights-metric-total">
-                    <dt><span class="metric-dot metric-dot-total" aria-hidden="true"></span><%= t('userInsights.totalTraffic') %></dt>
+                    <dt><span class="metric-dot metric-dot-total" aria-hidden="true"></span><%= t('userInsights.periodTraffic') %></dt>
                     <dd id="trafficTotal">—</dd>
+                    <dd class="insights-metric-note" id="trafficAverage">—</dd>
                 </div>
                 <div class="insights-metric">
                     <dt><span class="metric-dot metric-dot-tx" aria-hidden="true"></span><%= t('userInsights.uploaded') %></dt>
                     <dd id="trafficTx">—</dd>
+                    <dd class="insights-metric-note" id="trafficTxShare">—</dd>
                 </div>
                 <div class="insights-metric">
                     <dt><span class="metric-dot metric-dot-rx" aria-hidden="true"></span><%= t('userInsights.downloaded') %></dt>
                     <dd id="trafficRx">—</dd>
+                    <dd class="insights-metric-note" id="trafficRxShare">—</dd>
+                </div>
+                <div class="insights-metric insights-metric-peak">
+                    <dt><span class="metric-dot metric-dot-peak" aria-hidden="true"></span><%= t('userInsights.peakInterval') %></dt>
+                    <dd id="trafficPeak">—</dd>
+                    <dd class="insights-metric-note" id="trafficPeakTime">—</dd>
                 </div>
             </dl>
 
@@ -316,7 +401,17 @@
                             <span><i class="legend-line legend-line-rx" aria-hidden="true"></i><%= t('userInsights.downloaded') %></span>
                         </div>
                     </div>
-                    <div class="traffic-chart" id="trafficChart"></div>
+                    <div class="traffic-chart-shell">
+                        <div class="traffic-chart" id="trafficChart" tabindex="0" role="img"
+                             aria-describedby="trafficChartHelp"></div>
+                        <div class="traffic-chart-tooltip" id="trafficChartTooltip" aria-hidden="true" hidden>
+                            <time id="trafficTooltipTime">—</time>
+                            <div><span><i class="metric-dot metric-dot-total" aria-hidden="true"></i><%= t('userInsights.totalTraffic') %></span><strong id="trafficTooltipTotal">—</strong></div>
+                            <div><span><i class="metric-dot metric-dot-tx" aria-hidden="true"></i><%= t('userInsights.uploaded') %></span><strong id="trafficTooltipTx">—</strong></div>
+                            <div><span><i class="metric-dot metric-dot-rx" aria-hidden="true"></i><%= t('userInsights.downloaded') %></span><strong id="trafficTooltipRx">—</strong></div>
+                        </div>
+                    </div>
+                    <p class="ui-visually-hidden" id="trafficChartHelp"><%= t('userInsights.chartHelp') %></p>
                     <div class="insights-inline-empty" id="trafficChartEmpty" hidden>
                         <i class="ti ti-chart-dots" aria-hidden="true"></i>
                         <span><%= t('userInsights.noTrendPoints') %></span>
@@ -482,7 +577,7 @@ async function unlinkAllHwid() {
 }
 
 async function toggleUser(enabled) {
-    const res = await fetch(`/api/users/${userId}/${enabled ? 'enable' : 'disable'}`, {
+    const res = await fetch(`/api/users/${encodeURIComponent(userId)}/${enabled ? 'enable' : 'disable'}`, {
         method: 'POST',
         credentials: 'include'
     });
@@ -495,7 +590,7 @@ async function toggleUser(enabled) {
 
 async function resetTraffic() {
     if (!confirm(i18n.confirmResetTraffic)) return;
-    const res = await fetch(`/api/users/${userId}/reset-traffic`, {
+    const res = await fetch(`/api/users/${encodeURIComponent(userId)}/reset-traffic`, {
         method: 'POST',
         credentials: 'include'
     });
@@ -509,7 +604,7 @@ async function resetTraffic() {
 async function deleteUser() {
     if (!confirm(i18n.confirmDelete)) return;
     
-    const res = await fetch(`/api/users/${userId}`, {
+    const res = await fetch(`/api/users/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
         credentials: 'include'
     });
@@ -549,12 +644,21 @@ window.__USER_INSIGHTS__ = {
         currentPeriod: <%- jsonForScript(t('userInsights.currentPeriod')) %>,
         hourly: <%- jsonForScript(t('userInsights.hourly')) %>,
         daily: <%- jsonForScript(t('userInsights.daily')) %>,
+        currentBucketHint: <%- jsonForScript(t('userInsights.currentBucketHint')) %>,
+        range24Hours: <%- jsonForScript(t('userInsights.range24Hours')) %>,
+        range7Days: <%- jsonForScript(t('userInsights.range7Days')) %>,
+        range30Days: <%- jsonForScript(t('userInsights.range30Days')) %>,
         chartAria: <%- jsonForScript(t('userInsights.chartAria')) %>,
+        chartPointAria: <%- jsonForScript(t('userInsights.chartPointAria')) %>,
         uploaded: <%- jsonForScript(t('userInsights.uploaded')) %>,
         downloaded: <%- jsonForScript(t('userInsights.downloaded')) %>,
         totalTraffic: <%- jsonForScript(t('userInsights.totalTraffic')) %>,
+        averageHourly: <%- jsonForScript(t('userInsights.averageHourly')) %>,
+        averageDaily: <%- jsonForScript(t('userInsights.averageDaily')) %>,
+        shareOfPeriod: <%- jsonForScript(t('userInsights.shareOfPeriod')) %>,
         unknownNode: <%- jsonForScript(t('userInsights.unknownNode')) %>,
         nodeTrafficAria: <%- jsonForScript(t('userInsights.nodeTrafficAria')) %>,
+        nodeShare: <%- jsonForScript(t('userInsights.nodeShare')) %>,
         accepted: <%- jsonForScript(t('userInsights.accepted')) %>,
         rejected: <%- jsonForScript(t('userInsights.rejected')) %>,
         blocked: <%- jsonForScript(t('userInsights.blocked')) %>,

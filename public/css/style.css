@@ -33,6 +33,11 @@
     --info: #3b82f6;
     --info-bg: rgba(59, 130, 246, 0.15);
 
+    /* Directional data colors are separate from success/info states. */
+    --traffic-total: #a5b4fc;
+    --traffic-upload: #34d399;
+    --traffic-download: #60a5fa;
+
     --border: #27272a;
     --border-light: #3f3f46;
 
@@ -2292,8 +2297,15 @@ html {
     margin-bottom: 24px;
 }
 
+.col,
+.col-4,
+.col-6,
+.col-8 {
+    min-width: 0;
+}
+
 .col { flex: 1; }
-.col-4 { flex: 0 0 33.333%; }
+.col-4 { flex: 0 0 calc(33.333% - 12px); }
 .col-6 { flex: 0 0 calc(50% - 12px); }
 .col-8 { flex: 0 0 calc(66.666% - 12px); }
 
@@ -4865,6 +4877,192 @@ body {
     background: rgba(99, 102, 241, 0.2);
 }
 
+.traffic-quota {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    margin: 18px 0 4px;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    background: rgba(24, 24, 27, 0.48);
+}
+
+.traffic-quota > * {
+    min-width: 0;
+    padding: 16px 18px;
+    border-right: 1px solid var(--border);
+}
+
+.traffic-quota > :last-child {
+    border-right: 0;
+}
+
+.traffic-quota-status {
+    border-right: 0;
+}
+
+.traffic-quota-copy,
+.traffic-quota-status {
+    display: flex;
+    justify-content: center;
+    flex-direction: column;
+}
+
+.traffic-quota-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    font-weight: 600;
+}
+
+.traffic-quota-label i {
+    color: var(--traffic-total);
+    font-size: 15px;
+}
+
+.traffic-quota-value {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 5px;
+}
+
+.traffic-quota-value strong {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 21px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.025em;
+}
+
+.traffic-quota-value span,
+.traffic-quota-status > p {
+    color: var(--text-secondary);
+    font-size: 10.5px;
+}
+
+.traffic-quota-status > p {
+    margin: 5px 0 0;
+    line-height: 1.45;
+}
+
+.traffic-quota-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 9px;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+}
+
+.traffic-quota-meta strong {
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.traffic-quota-track {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--bg-hover);
+    overflow: hidden;
+}
+
+.traffic-quota-track > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--traffic-total);
+}
+
+.traffic-quota-warning .traffic-quota-track > span {
+    background: var(--warning);
+}
+
+.traffic-quota-danger .traffic-quota-track > span {
+    background: var(--danger);
+}
+
+.traffic-quota-danger .traffic-quota-status > p {
+    color: #fca5a5;
+}
+
+.traffic-quota-unlimited {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+}
+
+.traffic-quota-unlimited > i {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 36px;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-sm);
+    color: var(--traffic-total);
+    background: rgba(99, 102, 241, 0.14);
+    font-size: 18px;
+}
+
+.traffic-quota-unlimited div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.traffic-quota-unlimited strong {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.traffic-quota-unlimited span {
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    line-height: 1.45;
+}
+
+.traffic-current-split {
+    display: grid;
+    align-content: center;
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin: 0;
+    border-top: 1px solid var(--border);
+    border-right: 0;
+}
+
+.traffic-current-split > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+    gap: 12px;
+}
+
+.traffic-current-split dt {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+
+.traffic-current-split dd {
+    margin: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
 .insights-metrics {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -4872,6 +5070,10 @@ body {
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
     background: rgba(24, 24, 27, 0.55);
+}
+
+.traffic-period-metrics {
+    grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(0, 1fr));
 }
 
 .insights-metric {
@@ -4905,6 +5107,16 @@ body {
     white-space: nowrap;
 }
 
+.insights-metric .insights-metric-note {
+    margin-top: 4px;
+    overflow: hidden;
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+}
+
 .metric-dot {
     display: inline-block;
     flex: 0 0 7px;
@@ -4913,9 +5125,13 @@ body {
     border-radius: 50%;
 }
 
-.metric-dot-total { background: var(--accent-hover); }
-.metric-dot-tx { background: var(--success); }
-.metric-dot-rx { background: #60a5fa; }
+.metric-dot-total { background: var(--traffic-total); }
+.metric-dot-tx { background: var(--traffic-upload); }
+.metric-dot-rx { background: var(--traffic-download); }
+.metric-dot-peak {
+    background: transparent;
+    border: 1.5px solid var(--traffic-total);
+}
 
 .user-insights-visuals {
     display: grid;
@@ -4962,16 +5178,27 @@ body {
 
 .legend-line {
     display: inline-block;
-    width: 16px;
-    height: 2px;
-    border-radius: 1px;
+    width: 9px;
+    height: 9px;
+    border-radius: 3px;
 }
 
-.legend-line-tx { background: var(--success); }
-.legend-line-rx { background: #60a5fa; }
+.legend-line-tx { background: var(--traffic-upload); }
+.legend-line-rx { background: var(--traffic-download); }
+
+.traffic-chart-shell {
+    position: relative;
+}
 
 .traffic-chart {
-    min-height: 250px;
+    min-height: 260px;
+    border-radius: var(--radius-xs);
+    outline: none;
+    touch-action: pan-y;
+}
+
+.traffic-chart:focus-visible {
+    box-shadow: 0 0 0 2px var(--accent);
 }
 
 .traffic-chart svg {
@@ -4988,48 +5215,105 @@ body {
 
 .traffic-chart-axis-label {
     fill: var(--text-secondary);
-    font-family: 'Inter', sans-serif;
-    font-size: 10px;
+    font-size: 11px;
 }
 
-.traffic-chart-area {
-    stroke: none;
+.traffic-chart-selection {
+    fill: rgba(99, 102, 241, 0.1);
     pointer-events: none;
 }
 
-.traffic-chart-area-tx {
-    fill: rgba(34, 197, 94, 0.08);
+.traffic-chart-bar-group {
+    opacity: 0.88;
+    transition: opacity 160ms ease;
 }
 
-.traffic-chart-area-rx {
-    fill: rgba(96, 165, 250, 0.08);
+.traffic-chart-bar-group.is-current {
+    opacity: 0.58;
 }
 
-.traffic-chart-line {
-    fill: none;
-    stroke-width: 2;
-    stroke-linecap: round;
-    stroke-linejoin: round;
+.traffic-chart-bar-group.is-selected {
+    opacity: 1;
 }
 
-.traffic-chart-line-tx { stroke: var(--success); }
-.traffic-chart-line-rx { stroke: #60a5fa; }
-
-.traffic-chart-point {
-    stroke: var(--bg-secondary);
-    stroke-width: 2;
+.traffic-chart-bar {
+    shape-rendering: geometricPrecision;
 }
 
-.traffic-chart-point-tx { fill: var(--success); }
-.traffic-chart-point-rx { fill: #60a5fa; }
+.traffic-chart-bar-tx {
+    fill: var(--traffic-upload);
+}
+
+.traffic-chart-bar-rx {
+    fill: var(--traffic-download);
+}
+
+.traffic-chart-bar-group.is-current .traffic-chart-bar {
+    stroke: var(--text-secondary);
+    stroke-width: 0.75;
+    stroke-dasharray: 2 2;
+}
+
+.traffic-chart-peak {
+    fill: var(--traffic-total);
+    pointer-events: none;
+}
+
+.traffic-chart-tooltip {
+    position: absolute;
+    z-index: 2;
+    min-width: 188px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.32);
+    pointer-events: none;
+}
+
+.traffic-chart-tooltip[data-align="center"] { transform: translate(-50%, -100%); }
+.traffic-chart-tooltip[data-align="start"] { transform: translate(0, -100%); }
+.traffic-chart-tooltip[data-align="end"] { transform: translate(-100%, -100%); }
+.traffic-chart-tooltip[data-side="bottom"][data-align="center"] { transform: translate(-50%, 0); }
+.traffic-chart-tooltip[data-side="bottom"][data-align="start"] { transform: translate(0, 0); }
+.traffic-chart-tooltip[data-side="bottom"][data-align="end"] { transform: translate(-100%, 0); }
+
+.traffic-chart-tooltip time {
+    display: block;
+    margin-bottom: 7px;
+    color: var(--text-primary);
+    font-size: 11.5px;
+    font-weight: 600;
+}
+
+.traffic-chart-tooltip > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-size: 10.5px;
+}
+
+.traffic-chart-tooltip span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.traffic-chart-tooltip strong {
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+}
 
 .traffic-node-list {
     display: flex;
     flex-direction: column;
     gap: 15px;
-    max-height: 290px;
     padding-right: 2px;
-    overflow-y: auto;
 }
 
 .traffic-node {
@@ -5052,12 +5336,11 @@ body {
 }
 
 .traffic-node-identity strong {
-    overflow: hidden;
     color: var(--text-primary);
     font-size: 12.5px;
     font-weight: 600;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
 }
 
 .traffic-node-identity small {
@@ -5067,11 +5350,27 @@ body {
 }
 
 .traffic-node-total {
+    display: flex;
+    align-items: flex-end;
     flex-shrink: 0;
+    flex-direction: column;
+    gap: 1px;
     color: var(--text-primary);
+    text-align: right;
+}
+
+.traffic-node-total > strong {
     font-family: 'JetBrains Mono', monospace;
     font-size: 11px;
+    font-weight: 500;
     font-variant-numeric: tabular-nums;
+}
+
+.traffic-node-total > small {
+    color: var(--text-secondary);
+    font-size: 9px;
+    font-weight: 400;
+    white-space: nowrap;
 }
 
 .traffic-node-track {
@@ -5088,7 +5387,6 @@ body {
     min-width: 2px;
     overflow: hidden;
     border-radius: inherit;
-    transition: width 220ms cubic-bezier(0.25, 1, 0.5, 1);
 }
 
 .traffic-node-segment {
@@ -5096,8 +5394,8 @@ body {
     height: 100%;
 }
 
-.traffic-node-segment-tx { background: var(--success); }
-.traffic-node-segment-rx { background: #60a5fa; }
+.traffic-node-segment-tx { background: var(--traffic-upload); }
+.traffic-node-segment-rx { background: var(--traffic-download); }
 
 .traffic-node-split {
     color: var(--text-secondary);
@@ -5337,6 +5635,15 @@ body {
 }
 
 @media (max-width: 980px) {
+    .user-detail-layout {
+        flex-wrap: wrap;
+    }
+
+    .user-detail-layout > .col-8,
+    .user-detail-layout > .col-4 {
+        flex-basis: 100%;
+    }
+
     .user-insights-header {
         align-items: flex-start;
         flex-direction: column;
@@ -5348,6 +5655,40 @@ body {
 
     .user-insights-tab {
         flex: 1;
+    }
+
+    .traffic-quota {
+        grid-template-columns: 1fr;
+    }
+
+    .traffic-quota > * {
+        border-right: 0;
+    }
+
+    .traffic-quota-status,
+    .traffic-current-split {
+        grid-column: auto;
+        border-top: 1px solid var(--border);
+    }
+
+    .traffic-current-split {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .traffic-period-metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .traffic-period-metrics .insights-metric {
+        border-bottom: 1px solid var(--border);
+    }
+
+    .traffic-period-metrics .insights-metric:nth-child(2n) {
+        border-right: 0;
+    }
+
+    .traffic-period-metrics .insights-metric:nth-last-child(-n+2) {
+        border-bottom: 0;
     }
 
     .user-insights-visuals,
@@ -5401,6 +5742,41 @@ body {
         align-self: flex-start;
     }
 
+    .user-insights-tab,
+    .traffic-range-btn {
+        min-height: 44px;
+    }
+
+    .traffic-quota {
+        grid-template-columns: 1fr;
+    }
+
+    .traffic-quota > * {
+        padding: 14px 13px;
+        border-right: 0;
+    }
+
+    .traffic-quota-status,
+    .traffic-current-split {
+        grid-column: auto;
+        border-top: 1px solid var(--border);
+    }
+
+    .traffic-current-split {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+
+    .traffic-current-split > div {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 3px;
+    }
+
+    .traffic-quota-value strong {
+        font-size: 19px;
+    }
+
     .insights-metric {
         padding: 13px 11px;
     }
@@ -5427,7 +5803,12 @@ body {
     }
 
     .traffic-chart {
-        min-height: 220px;
+        min-height: 230px;
+    }
+
+    .traffic-chart-tooltip {
+        min-width: 170px;
+        padding: 9px 10px;
     }
 
     .insights-state {
@@ -5465,21 +5846,21 @@ body {
         font-size: 12px;
     }
 
-    .insights-metrics {
+    .insights-metrics:not(.traffic-period-metrics) {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .insights-metric-total {
+    .insights-metrics:not(.traffic-period-metrics) .insights-metric-total {
         grid-column: 1 / -1;
         border-right: 0;
         border-bottom: 1px solid var(--border);
     }
 
-    .insights-metric:nth-child(2) {
+    .insights-metrics:not(.traffic-period-metrics) .insights-metric:nth-child(2) {
         border-right: 1px solid var(--border);
     }
 
-    .insights-metrics-skeleton .ui-skeleton:first-child {
+    .insights-metrics-skeleton:not(.traffic-period-metrics) .ui-skeleton:first-child {
         grid-column: 1 / -1;
     }
 
@@ -5493,6 +5874,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
     .user-insights-tab,
     .traffic-range-btn,
+    .traffic-chart-bar-group,
     .traffic-node-fill {
         transition: none;
     }
