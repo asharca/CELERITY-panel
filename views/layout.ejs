@@ -83,7 +83,9 @@
                 <div class="lang-switcher">
                     <% const langOptions = typeof languageOptions !== 'undefined' ? languageOptions : []; %>
                     <% langOptions.forEach(function(option) { %>
-                    <a href="?lang=<%= encodeURIComponent(option.code) %>" class="lang-btn <%= lang === option.code ? 'active' : '' %>"><%= option.label %></a>
+                    <a href="?lang=<%= encodeURIComponent(option.code) %>"
+                       data-language-option="<%= option.code %>"
+                       class="lang-btn <%= lang === option.code ? 'active' : '' %>"><%= option.label %></a>
                     <% }); %>
                 </div>
                 <a href="https://github.com/ClickDevTech/CELERITY-panel" target="_blank" class="github-link" title="GitHub">
@@ -120,6 +122,18 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
+        document.querySelectorAll('[data-language-option]').forEach(link => {
+            const preserveCurrentLocation = () => {
+                const url = new URL(window.location.href);
+                url.searchParams.set('lang', link.dataset.languageOption);
+                link.href = url.pathname + url.search + url.hash;
+            };
+            preserveCurrentLocation();
+            ['pointerdown', 'focus', 'contextmenu', 'click'].forEach(eventName => {
+                link.addEventListener(eventName, preserveCurrentLocation);
+            });
+        });
+
         document.querySelectorAll('.nav-menu a').forEach(link => {
             link.addEventListener('click', () => {
                 if (window.innerWidth <= 768) {

@@ -86,13 +86,15 @@ router.get('/access-logs/api/analytics', async (req, res) => {
         const searchService = require('../../services/accessLogs/searchService');
         const result = await searchService.overview(filters, { topN: 10, userLimit: 25 });
 
-        if (result.degraded) {
+        if (result.degraded && !result.partial) {
             // ClickHouse is not configured/reachable: the whole feature is backed
             // by it, so there is nothing to show. The UI renders a "configure
             // ClickHouse" banner instead of zeros.
             return res.json({
                 enabled: true,
                 degraded: true,
+                partial: false,
+                partialErrors: {},
                 chRequired: true,
                 totals: {},
                 series: [],
@@ -100,6 +102,8 @@ router.get('/access-logs/api/analytics', async (req, res) => {
                 topPorts: [],
                 topBlocked: [],
                 users: [],
+                usersByIp: [],
+                usersByFanout: [],
             });
         }
         if (result.error) {
@@ -108,6 +112,8 @@ router.get('/access-logs/api/analytics', async (req, res) => {
             return res.json({
                 enabled: true,
                 degraded: true,
+                partial: false,
+                partialErrors: {},
                 chRequired: true,
                 error: result.error,
                 totals: {},
@@ -116,9 +122,17 @@ router.get('/access-logs/api/analytics', async (req, res) => {
                 topPorts: [],
                 topBlocked: [],
                 users: [],
+                usersByIp: [],
+                usersByFanout: [],
             });
         }
-        return res.json({ enabled: true, degraded: false, ...result });
+        return res.json({
+            enabled: true,
+            degraded: !!result.degraded,
+            partial: !!result.partial,
+            partialErrors: result.partialErrors || {},
+            ...result,
+        });
     } catch (error) {
         logger.error('[Panel] access-logs analytics error:', error.message);
         res.status(500).json({ error: 'analytics failed' });
@@ -127,17 +141,33 @@ router.get('/access-logs/api/analytics', async (req, res) => {
 
 router.get('/access-logs/api/search', async (req, res) => {
     try {
-        if (!(await isEnabled())) return res.json({ enabled: false, rows: [] });
+        const parsedLimit = parseInt(req.query.limit, 10);
+        const parsedOffset = parseInt(req.query.offset, 10);
+        const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(1000, parsedLimit)) : 200;
+        const offset = Number.isFinite(parsedOffset) ? Math.max(0, parsedOffset) : 0;
+        if (!(await isEnabled())) {
+            return res.json({ enabled: false, rows: [], hasMore: false, offset, limit });
+        }
         const filters = filtersFromQuery(req.query);
         const opts = {
-            limit: Math.min(1000, parseInt(req.query.limit, 10) || 200),
-            offset: Math.max(0, parseInt(req.query.offset, 10) || 0),
+            // Fetch one sentinel row so the response can distinguish an exact
+            // page from a truncated one without issuing a costly count query.
+            limit: limit + 1,
+            offset,
             sort: req.query.sort,
             dir: req.query.dir,
         };
         const searchService = require('../../services/accessLogs/searchService');
         const result = await searchService.search(filters, opts);
-        return res.json({ enabled: true, ...result });
+        const fetchedRows = Array.isArray(result.rows) ? result.rows : [];
+        return res.json({
+            enabled: true,
+            ...result,
+            rows: fetchedRows.slice(0, limit),
+            hasMore: fetchedRows.length > limit,
+            offset,
+            limit,
+        });
     } catch (error) {
         logger.error('[Panel] access-logs search error:', error.message);
         res.status(500).json({ error: 'search failed' });

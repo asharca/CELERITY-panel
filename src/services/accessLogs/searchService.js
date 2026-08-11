@@ -83,6 +83,20 @@ async function search(filters = {}, opts = {}) {
     const sortDir = opts.dir === 'asc' ? 'ASC' : 'DESC';
     const limit = Math.max(1, Math.min(MAX_ROW_LIMIT, Number(opts.limit) || DEFAULT_ROW_LIMIT));
     const offset = Math.max(0, Number(opts.offset) || 0);
+    // DateTime is stored at second precision, so event_time alone is not a
+    // stable order for offset pagination. Add deterministic value tie-breakers;
+    // byte-for-byte duplicate rows remain interchangeable to API consumers.
+    const tieBreakers = [
+        ['event_time', 'DESC'],
+        ['node_id', 'ASC'],
+        ['email', 'ASC'],
+        ['source_ip', 'ASC'],
+        ['raw', 'ASC'],
+    ].filter(([column]) => column !== sortCol);
+    const orderBy = [
+        `${sortCol} ${sortDir}`,
+        ...tieBreakers.map(([column, direction]) => `${column} ${direction}`),
+    ].join(', ');
 
     // Times are returned as Unix epoch seconds (absolute instants), not
     // formatted strings. This is version-independent (no reliance on
@@ -97,7 +111,7 @@ async function search(filters = {}, opts = {}) {
             inbound_tag, outbound_tag, action, raw, parse_ok
         FROM access_events
         ${where}
-        ORDER BY ${sortCol} ${sortDir}
+        ORDER BY ${orderBy}
         LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -176,9 +190,9 @@ async function overview(filters = {}, opts = {}) {
     const totalsSql = `
         SELECT
             count() AS total,
-            uniqExact(email) AS users,
-            uniqExact(source_ip) AS ips,
-            uniqExact(${DEST}) AS dests,
+            uniqExactIf(email, email != '') AS users,
+            uniqExactIf(source_ip, source_ip != '') AS ips,
+            uniqExactIf(${DEST}, ${DEST} != '') AS dests,
             countIf(action = 'accepted') AS accepted,
             countIf(action = 'rejected') AS rejected,
             countIf(action = 'blocked')  AS blocked,
@@ -211,27 +225,35 @@ async function overview(filters = {}, opts = {}) {
         FROM access_events ${where} ${andWhere} action IN ('blocked','rejected') AND ${DEST} != ''
         GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
 
-    const usersSql = `
+    const usersBaseSql = `
         SELECT
             email,
-            uniqExact(source_ip) AS ips,
-            uniqExact(${SUBNET}) AS subnets,
-            uniqExact(${DEST}) AS dests,
+            uniqExactIf(source_ip, source_ip != '') AS ips,
+            uniqExactIf(${SUBNET}, source_ip != '') AS subnets,
+            uniqExactIf(${DEST}, ${DEST} != '') AS dests,
             count() AS events,
             countIf(network = 'udp') / nullIf(count(), 0) AS udp_share,
             toUnixTimestamp(max(event_time)) AS last_seen
         FROM access_events ${where} ${andWhere} email != ''
-        GROUP BY email ORDER BY ips DESC LIMIT ${userN}`;
+        GROUP BY email`;
+
+    // These are separate global rankings. Re-sorting an IP-limited candidate
+    // set in the client can omit a low-IP user with exceptionally high fan-out.
+    const usersByIpSql = `${usersBaseSql}
+        ORDER BY ips DESC, events DESC, email ASC LIMIT ${userN}`;
+    const usersByFanoutSql = `${usersBaseSql}
+        ORDER BY dests DESC, events DESC, email ASC LIMIT ${userN}`;
 
     const timeoutMs = opts.timeoutMs || 30000;
     // Fire concurrently; ClickHouse handles the parallelism server-side.
-    const [totals, series, topDest, topPorts, topBlocked, users] = await Promise.all([
+    const [totals, series, topDest, topPorts, topBlocked, usersByIp, usersByFanout] = await Promise.all([
         clickhouse.query(totalsSql, params, { timeoutMs }),
         clickhouse.query(seriesSql, params, { timeoutMs }),
         clickhouse.query(topDestSql, params, { timeoutMs }),
         clickhouse.query(topPortsSql, params, { timeoutMs }),
         clickhouse.query(topBlockedSql, params, { timeoutMs }),
-        clickhouse.query(usersSql, params, { timeoutMs }),
+        clickhouse.query(usersByIpSql, params, { timeoutMs }),
+        clickhouse.query(usersByFanoutSql, params, { timeoutMs }),
     ]);
 
     // If the very first query could not even connect, report degraded so the UI
@@ -242,13 +264,41 @@ async function overview(filters = {}, opts = {}) {
         return { error: totals.error };
     }
 
+    const optionalResults = {
+        series,
+        topDestinations: topDest,
+        topPorts,
+        topBlocked,
+        usersByIp,
+        usersByFanout,
+    };
+    const partialErrors = Object.fromEntries(
+        Object.entries(optionalResults)
+            .filter(([, result]) => !result.ok)
+            .map(([name, result]) => [name, result.error || 'query_failed'])
+    );
+    const partial = Object.keys(partialErrors).length > 0;
+    if (partial) {
+        logger.warn(`[AccessLogs] overview partial failure: ${Object.entries(partialErrors)
+            .map(([name, error]) => `${name}=${error}`)
+            .join(', ')}`);
+    }
+
+    const usersByIpRows = (usersByIp.ok && usersByIp.rows) || [];
+    const usersByFanoutRows = (usersByFanout.ok && usersByFanout.rows) || [];
     return {
+        degraded: partial,
+        partial,
+        partialErrors,
         totals: (totals.rows && totals.rows[0]) || { total: 0, users: 0, ips: 0, dests: 0 },
         series: (series.ok && series.rows) || [],
         topDestinations: (topDest.ok && topDest.rows) || [],
         topPorts: (topPorts.ok && topPorts.rows) || [],
         topBlocked: (topBlocked.ok && topBlocked.rows) || [],
-        users: (users.ok && users.rows) || [],
+        // `users` remains an alias for the historical IP-ranked response shape.
+        users: usersByIpRows,
+        usersByIp: usersByIpRows,
+        usersByFanout: usersByFanoutRows,
     };
 }
 

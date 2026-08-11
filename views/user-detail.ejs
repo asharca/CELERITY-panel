@@ -11,6 +11,7 @@
             if (node?._id) names[String(node._id)] = node.name || String(node._id);
             return names;
         }, {});
+    const accessLogWindowFrom = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000)).toISOString();
     const finiteTrafficCount = (value) => {
         const count = Number(value);
         return Number.isFinite(count) ? Math.max(0, count) : 0;
@@ -442,7 +443,7 @@
                 <h3><%= t('userInsights.recentEvents') %></h3>
                 <p><%= t('userInsights.accessSubtitle') %></p>
             </div>
-            <a href="/panel/access-logs?email=<%= encodeURIComponent(user.userId) %>" class="btn btn-sm">
+            <a href="/panel/access-logs?email=<%= encodeURIComponent(user.userId) %>&amp;from=<%= encodeURIComponent(accessLogWindowFrom) %>" class="btn btn-sm">
                 <i class="ti ti-external-link" aria-hidden="true"></i> <%= t('userInsights.openAccessLogs') %>
             </a>
         </div>
@@ -635,12 +636,16 @@ QRCode.toCanvas(document.createElement('canvas'), subUrl, { width: 180, margin: 
 <script>
 window.__USER_INSIGHTS__ = {
     userId: <%- jsonForScript(user.userId) %>,
+    accessFrom: <%- jsonForScript(accessLogWindowFrom) %>,
     nodeNames: <%- jsonForScript(accessLogNodeNames) %>,
     i18n: {
         loadingTraffic: <%- jsonForScript(t('userInsights.loadingTraffic')) %>,
         loadingAccess: <%- jsonForScript(t('userInsights.loadingAccess')) %>,
         trafficLoaded: <%- jsonForScript(t('userInsights.trafficLoaded')) %>,
         accessLoaded: <%- jsonForScript(t('userInsights.accessLoaded')) %>,
+        accessDisabledTitle: <%- jsonForScript(t('userInsights.accessDisabledTitle')) %>,
+        accessDegradedTitle: <%- jsonForScript(t('userInsights.accessDegradedTitle')) %>,
+        accessErrorTitle: <%- jsonForScript(t('userInsights.accessErrorTitle')) %>,
         currentPeriod: <%- jsonForScript(t('userInsights.currentPeriod')) %>,
         hourly: <%- jsonForScript(t('userInsights.hourly')) %>,
         daily: <%- jsonForScript(t('userInsights.daily')) %>,

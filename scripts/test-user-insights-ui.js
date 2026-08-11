@@ -21,8 +21,8 @@ for (const range of ['24h', '7d', '30d']) {
 }
 assert.match(
     template,
-    /\/panel\/access-logs\?email=<%= encodeURIComponent\(user\.userId\) %>/,
-    'the full access-log link carries the encoded subscription account'
+    /\/panel\/access-logs\?email=<%= encodeURIComponent\(user\.userId\) %>&amp;from=<%= encodeURIComponent\(accessLogWindowFrom\) %>/,
+    'the full access-log link carries the encoded account and the same seven-day window'
 );
 assert.match(template, /jsonForScript/, 'inline account configuration uses script-safe JSON');
 assert.match(template, /class="traffic-quota traffic-quota-<%= accountTrafficState %>"/,
@@ -65,7 +65,7 @@ assert.match(accessClient, /function hydrateFiltersFromLocation\(/, 'the full ac
 assert.match(accessClient, /email:\s*'alEmail'/, 'the account query parameter maps to the user filter');
 assert.match(
     accessClient,
-    /if \(enabled\) \{\s*hydrateFiltersFromLocation\(\);\s*setDefaultRange\(\);/,
+    /hydrateFiltersFromLocation\(\);\s*if \(!\$\('alFrom'\) \|\| !\$\('alFrom'\)\.value\) setDefaultRange\(\);/,
     'deep-link filters are applied before the default time range'
 );
 
