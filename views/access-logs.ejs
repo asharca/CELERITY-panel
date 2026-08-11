@@ -1,359 +1,465 @@
+<%
+    const alJson = (value) => JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+    const alNodeNames = (nodes || []).reduce((names, node) => {
+        names[String(node._id)] = node.name;
+        return names;
+    }, {});
+%>
+
 <% if (!enabled) { %>
-<div class="alert alert-warning" style="margin-bottom: 16px;">
-    <i class="ti ti-alert-triangle"></i>
-    <%= t('accessLogs.disabledBanner') || 'Сбор access-логов выключен. Включите его в Настройках.' %>
-    <a href="/panel/settings#tab-accessLogs" style="margin-left: 8px;"><%= t('nav.settings') || 'Настройки' %></a>
-</div>
-<% } %>
+<section class="insights-state al-disabled-state" aria-labelledby="alDisabledTitle">
+    <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-list-search"></i></span>
+    <div>
+        <h2 id="alDisabledTitle"><%= t('accessLogs.disabledTitle') %></h2>
+        <p><%= t('accessLogs.disabledBanner') %></p>
+        <a href="/panel/settings?tab=accessLogs" class="btn btn-primary btn-sm">
+            <i class="ti ti-settings" aria-hidden="true"></i>
+            <%= t('accessLogs.openSettings') %>
+        </a>
+    </div>
+</section>
+<% } else { %>
+<div id="accessLogsApp" class="access-logs-app" data-enabled="1" data-state="<%= state %>">
+    <div id="alProgress" class="al-progress" aria-hidden="true"><span></span></div>
+    <p id="alLive" class="ui-visually-hidden" role="status" aria-live="polite"></p>
 
-<div id="accessLogsApp" data-enabled="<%= enabled ? '1' : '0' %>">
-    <!-- Indeterminate top progress bar; active whenever a request is in flight -->
-    <div id="alProgress" class="al-progress"></div>
-
-    <!-- Degraded-mode banner (toggled by JS) -->
-    <div id="alDegraded" class="alert alert-info" style="display:none; margin-bottom:14px;">
-        <i class="ti ti-info-circle"></i>
-        <%= t('accessLogs.chRequired') || 'Функция требует ClickHouse. Настройте подключение в Настройках.' %>
+    <div id="alDegraded" class="alert alert-info al-page-alert" role="status" hidden>
+        <i class="ti ti-database-off" aria-hidden="true"></i>
+        <span><%= t('accessLogs.chRequired') %></span>
+        <a href="/panel/settings?tab=accessLogs"><%= t('accessLogs.openSettings') %></a>
     </div>
 
-    <!-- Summary cards -->
-    <div class="stats-grid stats-summary-grid" style="margin-bottom:16px;">
-        <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-list"></i></span></div>
-            <div class="stat-value" id="alTotal">—</div>
-            <div class="stat-label"><%= t('accessLogs.statEvents') || 'Событий' %></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-users"></i></span></div>
-            <div class="stat-value" id="alUsers">—</div>
-            <div class="stat-label"><%= t('accessLogs.statUsers') || 'Пользователей' %></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-world"></i></span></div>
-            <div class="stat-value" id="alIps">—</div>
-            <div class="stat-label"><%= t('accessLogs.statUniqueIps') || 'Уникальных IP' %></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-map-pin"></i></span></div>
-            <div class="stat-value" id="alDests">—</div>
-            <div class="stat-label"><%= t('accessLogs.statUniqueDests') || 'Назначений' %></div>
-        </div>
-    </div>
+    <section class="al-filter-panel" aria-labelledby="alFilterTitle">
+        <header class="al-filter-header">
+            <div>
+                <h2 id="alFilterTitle"><%= t('accessLogs.exploreTitle') %></h2>
+                <p id="alRangeSummary"><%= t('accessLogs.defaultRangeHint') %></p>
+            </div>
+            <span id="alHealthBadge" class="al-health-badge al-health-loading">
+                <i class="ti ti-loader-2 al-spin" aria-hidden="true"></i>
+                <%= t('accessLogs.checkingPipeline') %>
+            </span>
+        </header>
 
-    <!-- Filters -->
-    <div class="card" style="margin-bottom:16px;">
-        <div class="card-body">
-            <form id="alFilters" class="settings-grid" style="gap:12px;">
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterFrom') || 'С' %></label>
-                    <input type="datetime-local" name="from" id="alFrom">
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterTo') || 'По' %></label>
-                    <input type="datetime-local" name="to" id="alTo">
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterNode') || 'Нода' %></label>
-                    <select name="nodeId" id="alNode">
-                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
-                        <% (nodes || []).forEach(n => { %>
-                            <option value="<%= n._id %>"><%= n.name %></option>
-                        <% }) %>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterUser') || 'Пользователь' %></label>
-                    <input type="text" name="email" id="alEmail" placeholder="email">
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterSourceIp') || 'Source IP' %></label>
-                    <input type="text" name="sourceIp" id="alSourceIp">
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterDestination') || 'Назначение' %></label>
-                    <input type="text" name="destination" id="alDest">
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterProtocol') || 'Протокол' %></label>
-                    <select name="network" id="alNetwork">
-                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
-                        <option value="tcp">tcp</option>
-                        <option value="udp">udp</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label><%= t('accessLogs.filterAction') || 'Действие' %></label>
-                    <select name="action" id="alAction">
-                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
-                        <option value="accepted">accepted</option>
-                        <option value="rejected">rejected</option>
-                        <option value="blocked">blocked</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>&nbsp;</label>
-                    <div style="display:flex; gap:8px;">
-                        <button type="submit" class="btn btn-primary" id="alSearchBtn">
-                            <i class="ti ti-search" id="alSearchIcon"></i> <%= t('accessLogs.search') || 'Поиск' %>
-                        </button>
-                        <button type="button" class="btn" id="alReset"><%= t('common.reset') || 'Сброс' %></button>
+        <form id="alFilters" novalidate>
+            <div class="al-filter-toolbar">
+                <fieldset class="al-range-fieldset">
+                    <legend><%= t('accessLogs.quickRange') %></legend>
+                    <div class="al-range-controls" role="group" aria-label="<%= t('accessLogs.quickRange') %>">
+                        <button type="button" class="al-range-btn active" data-hours="24" aria-pressed="true">24h</button>
+                        <button type="button" class="al-range-btn" data-hours="168" aria-pressed="false">7d</button>
+                        <button type="button" class="al-range-btn" data-hours="720" aria-pressed="false">30d</button>
+                    </div>
+                </fieldset>
+
+                <div class="form-group al-filter-search">
+                    <label for="alQuery"><%= t('accessLogs.filterQuery') %></label>
+                    <div class="al-search-input">
+                        <i class="ti ti-search" aria-hidden="true"></i>
+                        <input type="search" name="q" id="alQuery"
+                               placeholder="<%= t('accessLogs.filterQueryPlaceholder') %>"
+                               autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search">
                     </div>
                 </div>
-            </form>
-        </div>
-    </div>
 
-    <!-- Charts -->
-    <div class="al-charts-grid" style="margin-bottom:16px;">
-        <div class="card al-chart-wide">
-            <div class="card-header"><h2><i class="ti ti-chart-area"></i> <%= t('accessLogs.activityTimeline') || 'Активность во времени' %></h2></div>
-            <div class="card-body al-chart-body"><canvas id="alTimeline"></canvas></div>
-        </div>
-        <div class="card">
-            <div class="card-header"><h2><i class="ti ti-chart-donut"></i> <%= t('accessLogs.actionBreakdown') || 'Действия' %></h2></div>
-            <div class="card-body al-chart-body al-chart-body-sm"><canvas id="alActionChart"></canvas></div>
-        </div>
-        <div class="card">
-            <div class="card-header"><h2><i class="ti ti-chart-pie"></i> <%= t('accessLogs.protocolBreakdown') || 'Протоколы' %></h2></div>
-            <div class="card-body al-chart-body al-chart-body-sm"><canvas id="alProtoChart"></canvas></div>
-        </div>
-    </div>
+                <div class="form-group">
+                    <label for="alEmail"><%= t('accessLogs.filterUser') %></label>
+                    <input type="text" name="email" id="alEmail"
+                           placeholder="<%= t('accessLogs.filterUserPlaceholder') %>"
+                           autocomplete="off" autocapitalize="none" spellcheck="false">
+                </div>
 
-    <!-- Users: sharing + fan-out lenses -->
-    <div class="al-row" style="margin-bottom:16px;">
-        <div class="card al-col">
-            <div class="card-header">
-                <h2><i class="ti ti-user-share"></i> <%= t('accessLogs.usersByIp') || 'Пользователи по числу IP' %></h2>
-            </div>
-            <div class="card-body">
-                <p class="hint" style="margin:0 0 10px;">
-                    <%= t('accessLogs.usersByIpHint') || '' %>
-                    <span class="hint"><%= t('accessLogs.usersByIpExpand') || 'Нажмите на пользователя, чтобы увидеть все его IP.' %></span>
-                </p>
-                <div style="overflow-x:auto;">
-                    <table class="al-tbl">
-                        <thead><tr>
-                            <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colIps') || 'IP' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colSubnets') || '/24' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colEvents') || 'Событий' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colLastSeen') || 'Активность' %></th>
-                        </tr></thead>
-                        <tbody id="alUsersByIp"></tbody>
-                    </table>
+                <div class="form-group">
+                    <label for="alDest"><%= t('accessLogs.filterDestination') %></label>
+                    <input type="text" name="destination" id="alDest"
+                           placeholder="<%= t('accessLogs.filterDestinationPlaceholder') %>"
+                           autocomplete="off" autocapitalize="none" spellcheck="false">
+                </div>
+
+                <div class="form-group">
+                    <label for="alAction"><%= t('accessLogs.filterAction') %></label>
+                    <select name="action" id="alAction">
+                        <option value=""><%= t('accessLogs.allActions') %></option>
+                        <option value="accepted"><%= t('accessLogs.actionAccepted') %></option>
+                        <option value="rejected"><%= t('accessLogs.actionRejected') %></option>
+                        <option value="blocked"><%= t('accessLogs.actionBlocked') %></option>
+                    </select>
+                </div>
+
+                <div class="al-filter-actions">
+                    <button type="submit" class="btn btn-primary" id="alSearchBtn">
+                        <i class="ti ti-search" id="alSearchIcon" aria-hidden="true"></i>
+                        <span><%= t('accessLogs.applyFilters') %></span>
+                    </button>
+                    <button type="button" class="btn" id="alReset">
+                        <i class="ti ti-restore" aria-hidden="true"></i>
+                        <%= t('common.reset') %>
+                    </button>
                 </div>
             </div>
-        </div>
-        <div class="card al-col">
-            <div class="card-header">
-                <h2><i class="ti ti-affiliate"></i> <%= t('accessLogs.usersByFanout') || 'Пользователи по назначениям' %></h2>
-            </div>
-            <div class="card-body">
-                <p class="hint" style="margin:0 0 10px;"><%= t('accessLogs.usersByFanoutHint') || '' %></p>
-                <div style="overflow-x:auto;">
-                    <table class="al-tbl">
-                        <thead><tr>
-                            <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colDests') || 'Назнач.' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colUdp') || 'UDP %' %></th>
-                            <th style="text-align:right;"><%= t('accessLogs.colEvents') || 'Событий' %></th>
-                        </tr></thead>
-                        <tbody id="alUsersByFanout"></tbody>
-                    </table>
+
+            <details class="al-advanced-filters" id="alAdvancedFilters">
+                <summary>
+                    <span><i class="ti ti-adjustments-horizontal" aria-hidden="true"></i><%= t('accessLogs.moreFilters') %></span>
+                    <span id="alAdvancedCount" class="al-filter-count" hidden></span>
+                </summary>
+                <div class="al-advanced-grid">
+                    <div class="form-group">
+                        <label for="alFrom"><%= t('accessLogs.filterFrom') %></label>
+                        <input type="datetime-local" name="from" id="alFrom">
+                    </div>
+                    <div class="form-group">
+                        <label for="alTo"><%= t('accessLogs.filterTo') %></label>
+                        <input type="datetime-local" name="to" id="alTo">
+                    </div>
+                    <div class="form-group">
+                        <label for="alNode"><%= t('accessLogs.filterNode') %></label>
+                        <select name="nodeId" id="alNode">
+                            <option value=""><%= t('accessLogs.allNodes') %></option>
+                            <% (nodes || []).forEach(node => { %>
+                                <option value="<%= node._id %>"><%= node.name %></option>
+                            <% }) %>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="alSourceIp"><%= t('accessLogs.filterSource') %></label>
+                        <input type="text" name="sourceIp" id="alSourceIp"
+                               placeholder="<%= t('accessLogs.filterSourcePlaceholder') %>"
+                               autocomplete="off" autocapitalize="none" spellcheck="false">
+                    </div>
+                    <div class="form-group">
+                        <label for="alNetwork"><%= t('accessLogs.filterProtocol') %></label>
+                        <select name="network" id="alNetwork">
+                            <option value=""><%= t('accessLogs.allProtocols') %></option>
+                            <option value="tcp">TCP</option>
+                            <option value="udp">UDP</option>
+                        </select>
+                    </div>
                 </div>
+            </details>
+
+            <p id="alFilterError" class="al-filter-error" role="alert" hidden></p>
+            <div id="alActiveFilters" class="al-active-filters" aria-label="<%= t('accessLogs.activeFilters') %>" hidden></div>
+        </form>
+    </section>
+
+    <dl class="al-summary" aria-label="<%= t('accessLogs.selectedSummary') %>">
+        <div>
+            <dt><span class="metric-dot metric-dot-total" aria-hidden="true"></span><%= t('accessLogs.statParsedEvents') %></dt>
+            <dd id="alTotal">—</dd>
+        </div>
+        <div>
+            <dt><i class="ti ti-users" aria-hidden="true"></i><%= t('accessLogs.statUsers') %></dt>
+            <dd id="alUsers">—</dd>
+        </div>
+        <div>
+            <dt><i class="ti ti-world" aria-hidden="true"></i><%= t('accessLogs.statUniqueSources') %></dt>
+            <dd id="alIps">—</dd>
+        </div>
+        <div>
+            <dt><i class="ti ti-map-pin" aria-hidden="true"></i><%= t('accessLogs.statUniqueDests') %></dt>
+            <dd id="alDests">—</dd>
+        </div>
+        <div class="al-summary-risk">
+            <dt><i class="ti ti-shield-x" aria-hidden="true"></i><%= t('accessLogs.statRejectedBlocked') %></dt>
+            <dd id="alRisk">—</dd>
+        </div>
+    </dl>
+
+    <section class="card al-events-card" aria-labelledby="alEventsTitle">
+        <header class="card-header al-card-heading">
+            <div>
+                <h2 id="alEventsTitle"><i class="ti ti-list-details" aria-hidden="true"></i><%= t('accessLogs.recentEvents') %></h2>
+                <p><%= t('accessLogs.recentEventsHint') %></p>
+            </div>
+            <span id="alResultCount" class="al-result-count" aria-live="polite"></span>
+        </header>
+
+        <div id="alSearchError" class="insights-state insights-state-error al-inline-state" role="alert" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-alert-circle"></i></span>
+            <div>
+                <h3><%= t('accessLogs.searchErrorTitle') %></h3>
+                <p id="alSearchErrorText"><%= t('accessLogs.searchErrorDescription') %></p>
+                <button type="button" class="btn btn-sm" id="alRetrySearch"><i class="ti ti-refresh" aria-hidden="true"></i><%= t('accessLogs.retry') %></button>
             </div>
         </div>
-    </div>
 
-    <!-- Top lists -->
-    <div class="al-row al-row-3" style="margin-bottom:16px;">
-        <div class="card al-col">
-            <div class="card-header"><h2><i class="ti ti-map-pin"></i> <%= t('accessLogs.topDestinations') || 'Топ назначений' %></h2></div>
-            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopDest"></tbody></table></div>
-        </div>
-        <div class="card al-col">
-            <div class="card-header"><h2><i class="ti ti-plug"></i> <%= t('accessLogs.topPorts') || 'Топ портов' %></h2></div>
-            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopPorts"></tbody></table></div>
-        </div>
-        <div class="card al-col">
-            <div class="card-header"><h2><i class="ti ti-shield-x"></i> <%= t('accessLogs.topBlocked') || 'Топ заблокированных' %></h2></div>
-            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopBlocked"></tbody></table></div>
-        </div>
-    </div>
-
-    <!-- Recent events -->
-    <div class="card" style="margin-bottom:16px;">
-        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
-            <h2><i class="ti ti-list-details"></i> <%= t('accessLogs.recentEvents') || 'Последние события' %></h2>
-            <span id="alResultCount" class="hint"></span>
-        </div>
-        <div class="card-body" style="overflow-x:auto;">
-            <table class="al-tbl">
+        <div id="alEventsTableWrap" class="al-table-scroll" tabindex="0" role="region" aria-label="<%= t('accessLogs.recentEvents') %>">
+            <table class="al-table al-events-table">
+                <caption class="ui-visually-hidden"><%= t('accessLogs.recentEventsCaption') %></caption>
                 <thead>
                     <tr>
-                        <th><%= t('accessLogs.colTime') || 'Время' %></th>
-                        <th><%= t('accessLogs.filterNode') || 'Нода' %></th>
-                        <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
-                        <th><%= t('accessLogs.colSource') || 'Источник' %></th>
-                        <th><%= t('accessLogs.colDest') || 'Назначение' %></th>
-                        <th><%= t('accessLogs.colNet') || 'Проток.' %></th>
-                        <th><%= t('accessLogs.colAction') || 'Действие' %></th>
+                        <th scope="col"><%= t('accessLogs.colTime') %></th>
+                        <th scope="col"><%= t('accessLogs.filterNode') %></th>
+                        <th scope="col"><%= t('accessLogs.colUser') %></th>
+                        <th scope="col"><%= t('accessLogs.colSource') %></th>
+                        <th scope="col"><%= t('accessLogs.colDest') %></th>
+                        <th scope="col"><%= t('accessLogs.colNet') %></th>
+                        <th scope="col"><%= t('accessLogs.colAction') %></th>
                     </tr>
                 </thead>
                 <tbody id="alResults"></tbody>
             </table>
-            <div id="alNoResults" class="hint" style="display:none; padding:12px;">
-                <%= t('accessLogs.noResults') || 'Ничего не найдено' %>
+        </div>
+
+        <div id="alNoResults" class="insights-state al-inline-state" hidden>
+            <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-search-off"></i></span>
+            <div>
+                <h3><%= t('accessLogs.noResultsTitle') %></h3>
+                <p><%= t('accessLogs.noResultsDescription') %></p>
             </div>
         </div>
-    </div>
 
-    <!-- Node status + purge -->
-    <div class="card">
-        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
-            <h2><i class="ti ti-server-cog"></i> Status</h2>
-            <span class="hint">Spool: <span id="alSpool">—</span></span>
-        </div>
-        <div class="card-body" style="overflow-x:auto;">
-            <table class="al-tbl">
-                <thead><tr><th><%= t('accessLogs.filterNode') || 'Нода' %></th><th>agent</th><th>status</th><th><%= t('accessLogs.lastIngestAt') || 'Последний приём' %></th><th>error</th></tr></thead>
-                <tbody id="alNodeStatus"></tbody>
-            </table>
-            <hr class="settings-divider">
-            <button type="button" class="btn btn-danger" id="alPurge">
-                <i class="ti ti-trash"></i> <%= t('accessLogs.purge') || 'Очистить сохранённые логи' %>
+        <footer class="al-events-footer">
+            <button type="button" class="btn btn-sm" id="alLoadMore" hidden>
+                <i class="ti ti-chevrons-down" aria-hidden="true"></i><%= t('accessLogs.loadMore') %>
             </button>
+        </footer>
+    </section>
+
+    <details class="al-analysis-section" open>
+        <summary class="al-section-heading">
+            <div>
+                <h2><i class="ti ti-chart-histogram" aria-hidden="true"></i><%= t('accessLogs.analysisTitle') %></h2>
+                <p><%= t('accessLogs.analysisDescription') %></p>
+            </div>
+            <i class="ti ti-chevron-down al-section-chevron" aria-hidden="true"></i>
+        </summary>
+
+        <div class="al-analysis-body">
+            <div id="alAnalyticsWarning" class="alert alert-warning al-page-alert" role="status" hidden>
+                <i class="ti ti-alert-triangle" aria-hidden="true"></i>
+                <span><%= t('accessLogs.partialAnalyticsWarning') %></span>
+            </div>
+
+            <div id="alAnalyticsError" class="insights-state insights-state-error al-inline-state" role="alert" hidden>
+                <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-alert-circle"></i></span>
+                <div>
+                    <h3><%= t('accessLogs.analyticsErrorTitle') %></h3>
+                    <p id="alAnalyticsErrorText"><%= t('accessLogs.analyticsErrorDescription') %></p>
+                    <button type="button" class="btn btn-sm" id="alRetryAnalytics"><i class="ti ti-refresh" aria-hidden="true"></i><%= t('accessLogs.retry') %></button>
+                </div>
+            </div>
+
+            <div id="alAnalyticsEmpty" class="insights-state al-inline-state" hidden>
+                <span class="insights-state-icon" aria-hidden="true"><i class="ti ti-chart-bar-off"></i></span>
+                <div>
+                    <h3><%= t('accessLogs.analyticsEmptyTitle') %></h3>
+                    <p><%= t('accessLogs.analyticsEmptyDescription') %></p>
+                </div>
+            </div>
+
+            <div id="alAnalyticsContent">
+                <div class="al-analytics-grid">
+                    <section class="card al-timeline-card" aria-labelledby="alTimelineTitle">
+                        <header class="card-header al-card-heading">
+                            <div>
+                                <h2 id="alTimelineTitle"><i class="ti ti-chart-bar" aria-hidden="true"></i><%= t('accessLogs.activityTimeline') %></h2>
+                                <p id="alTimelineDescription"><%= t('accessLogs.timelineGapHint') %></p>
+                            </div>
+                        </header>
+                        <div class="card-body al-chart-body">
+                            <canvas id="alTimeline" role="img" aria-label="<%= t('accessLogs.activityTimeline') %>" aria-describedby="alTimelineDescription"></canvas>
+                            <p id="alTimelineFallback" class="al-chart-fallback" hidden><%= t('accessLogs.chartUnavailable') %></p>
+                        </div>
+                    </section>
+
+                    <section class="card al-breakdown-card" aria-labelledby="alBreakdownTitle">
+                        <header class="card-header al-card-heading">
+                            <div>
+                                <h2 id="alBreakdownTitle"><i class="ti ti-chart-dots" aria-hidden="true"></i><%= t('accessLogs.breakdownTitle') %></h2>
+                                <p><%= t('accessLogs.breakdownHint') %></p>
+                            </div>
+                        </header>
+                        <div class="card-body al-breakdowns">
+                            <div class="al-breakdown-block">
+                                <h3><%= t('accessLogs.actionBreakdown') %></h3>
+                                <div id="alActionBar" class="al-segmented-bar" role="img"></div>
+                                <ul id="alActionLegend" class="al-breakdown-legend"></ul>
+                            </div>
+                            <div class="al-breakdown-block">
+                                <h3><%= t('accessLogs.protocolBreakdown') %></h3>
+                                <div id="alProtoBar" class="al-segmented-bar" role="img"></div>
+                                <ul id="alProtoLegend" class="al-breakdown-legend"></ul>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="al-lens-grid">
+                    <section class="card">
+                        <header class="card-header al-card-heading">
+                            <div>
+                                <h2><i class="ti ti-user-share" aria-hidden="true"></i><%= t('accessLogs.usersBySource') %></h2>
+                                <p><%= t('accessLogs.usersBySourceHint') %></p>
+                            </div>
+                        </header>
+                        <div class="al-table-scroll" tabindex="0" role="region" aria-label="<%= t('accessLogs.usersBySource') %>">
+                            <table class="al-table">
+                                <caption class="ui-visually-hidden"><%= t('accessLogs.usersBySourceCaption') %></caption>
+                                <thead><tr>
+                                    <th scope="col"><%= t('accessLogs.colUser') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colSources') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colEvents') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colLastSeen') %></th>
+                                </tr></thead>
+                                <tbody id="alUsersByIp"></tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section class="card">
+                        <header class="card-header al-card-heading">
+                            <div>
+                                <h2><i class="ti ti-affiliate" aria-hidden="true"></i><%= t('accessLogs.usersByFanout') %></h2>
+                                <p><%= t('accessLogs.usersByFanoutHint') %></p>
+                            </div>
+                        </header>
+                        <div class="al-table-scroll" tabindex="0" role="region" aria-label="<%= t('accessLogs.usersByFanout') %>">
+                            <table class="al-table">
+                                <caption class="ui-visually-hidden"><%= t('accessLogs.usersByFanoutCaption') %></caption>
+                                <thead><tr>
+                                    <th scope="col"><%= t('accessLogs.colUser') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colDests') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colUdp') %></th>
+                                    <th scope="col" class="al-num"><%= t('accessLogs.colEvents') %></th>
+                                </tr></thead>
+                                <tbody id="alUsersByFanout"></tbody>
+                            </table>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="al-top-grid">
+                    <% [
+                        { id: 'alTopDest', icon: 'ti-map-pin', title: 'topDestinations', label: 'colDest' },
+                        { id: 'alTopPorts', icon: 'ti-plug', title: 'topPorts', label: 'colPort' },
+                        { id: 'alTopBlocked', icon: 'ti-shield-x', title: 'topBlocked', label: 'colDest' }
+                    ].forEach(item => { %>
+                    <section class="card">
+                        <header class="card-header"><h2><i class="ti <%= item.icon %>" aria-hidden="true"></i><%= t(`accessLogs.${item.title}`) %></h2></header>
+                        <div class="al-table-scroll" tabindex="0" role="region" aria-label="<%= t(`accessLogs.${item.title}`) %>">
+                            <table class="al-table al-top-table">
+                                <caption class="ui-visually-hidden"><%= t(`accessLogs.${item.title}`) %></caption>
+                                <thead><tr><th scope="col"><%= t(`accessLogs.${item.label}`) %></th><th scope="col" class="al-num"><%= t('accessLogs.colHits') %></th></tr></thead>
+                                <tbody id="<%= item.id %>"></tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <% }); %>
+                </div>
+            </div>
         </div>
-    </div>
+    </details>
+
+    <details class="card al-pipeline-panel">
+        <summary class="card-header al-card-heading">
+            <div>
+                <h2><i class="ti ti-server-cog" aria-hidden="true"></i><%= t('accessLogs.pipelineTitle') %></h2>
+                <p><%= t('accessLogs.pipelineDescription') %></p>
+            </div>
+            <span id="alSpoolSummary" class="al-pipeline-summary"><%= t('accessLogs.checkingPipeline') %></span>
+        </summary>
+        <div class="card-body">
+            <div class="al-table-scroll" tabindex="0" role="region" aria-label="<%= t('accessLogs.pipelineTitle') %>">
+                <table class="al-table">
+                    <caption class="ui-visually-hidden"><%= t('accessLogs.pipelineCaption') %></caption>
+                    <thead><tr>
+                        <th scope="col"><%= t('accessLogs.filterNode') %></th>
+                        <th scope="col"><%= t('accessLogs.agentVersion') %></th>
+                        <th scope="col"><%= t('common.status') %></th>
+                        <th scope="col"><%= t('accessLogs.lastIngestAt') %></th>
+                        <th scope="col"><%= t('accessLogs.lastError') %></th>
+                    </tr></thead>
+                    <tbody id="alNodeStatus"></tbody>
+                </table>
+            </div>
+
+            <div class="al-danger-zone">
+                <div>
+                    <strong><%= t('accessLogs.purge') %></strong>
+                    <span><%= t('accessLogs.purgeHint') %></span>
+                </div>
+                <button type="button" class="btn btn-danger" id="alPurge">
+                    <i class="ti ti-trash" aria-hidden="true"></i><%= t('accessLogs.purge') %>
+                </button>
+            </div>
+        </div>
+    </details>
 </div>
+<% } %>
 
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-<style>
-.al-charts-grid {
-    display: grid;
-    grid-template-columns: 2fr 1fr 1fr;
-    gap: 16px;
-}
-.al-chart-wide { grid-column: auto; }
-.al-chart-body { height: 280px; position: relative; }
-.al-chart-body-sm { height: 280px; }
-.al-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.al-row-3 { grid-template-columns: 1fr 1fr 1fr; }
-/* ── Tables ─────────────────────────────────────────────────────────── */
-.al-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
-.al-tbl thead th {
-    text-align: left; font-weight: 600; font-size: 11px;
-    text-transform: uppercase; letter-spacing: .04em;
-    color: var(--text-muted, #8b8b96);
-    padding: 8px 10px; white-space: nowrap;
-    border-bottom: 1px solid var(--border-color, rgba(255,255,255,.08));
-}
-.al-tbl tbody td {
-    padding: 9px 10px; vertical-align: middle;
-    border-bottom: 1px solid var(--border-color, rgba(255,255,255,.05));
-}
-.al-tbl tbody tr:last-child td { border-bottom: 0; }
-.al-tbl tbody tr:hover { background: rgba(255,255,255,.035); }
-.al-tbl-top tbody td { padding: 7px 10px; }
-.al-mono {
-    font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Consolas, monospace;
-    font-size: 12px;
-}
-.al-trunc { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.al-num { text-align: right; font-variant-numeric: tabular-nums; }
-
-.al-badge {
-    display: inline-block; padding: 2px 9px; border-radius: 999px;
-    font-size: 11px; font-weight: 600; line-height: 1.5; white-space: nowrap;
-}
-.al-badge-accepted { background: rgba(34,197,94,.14); color: #4ade80; }
-.al-badge-rejected { background: rgba(245,158,11,.15); color: #fbbf24; }
-.al-badge-blocked  { background: rgba(239,68,68,.15);  color: #f87171; }
-.al-badge-net      { background: rgba(99,102,241,.16); color: #a5b4fc; }
-.al-badge-udp      { background: rgba(6,182,212,.16);  color: #67e8f9; }
-
-.al-bar-cell { position: relative; }
-.al-bar {
-    position: absolute; right: 0; top: 4px; bottom: 4px;
-    background: var(--accent-glow, rgba(124,58,237,.22));
-    border-radius: 4px; z-index: 0;
-}
-.al-bar-label { position: relative; z-index: 1; font-variant-numeric: tabular-nums; }
-.al-flag { color: var(--danger, #ef4444); font-weight: 600; }
-
-/* ── Expandable user rows (per-user IP list) ────────────────────────── */
-.al-user-row { cursor: pointer; }
-.al-caret {
-    display: inline-block; transition: transform .15s ease;
-    color: var(--text-muted, #8b8b96); margin-right: 4px;
-}
-.al-user-row.open .al-caret { transform: rotate(90deg); }
-.al-ip-detail > td { background: rgba(255,255,255,.02); padding: 10px 14px !important; }
-.al-ip-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
-.al-ip-chip {
-    display: inline-flex; flex-direction: column; gap: 1px;
-    padding: 5px 10px; border-radius: 8px;
-    background: rgba(255,255,255,.05);
-    border: 1px solid var(--border-color, rgba(255,255,255,.07));
-}
-.al-ip-chip .al-ip-meta { font-size: 10.5px; color: var(--text-muted, #8b8b96); }
-.al-empty { color: var(--text-muted, #8b8b96); padding: 12px 10px; }
-
-/* ── Loading indicators ─────────────────────────────────────────────── */
-.al-progress {
-    position: relative; height: 3px; margin-bottom: 14px;
-    border-radius: 3px; overflow: hidden; background: transparent;
-    opacity: 0; transition: opacity .2s ease;
-}
-.al-progress.active { opacity: 1; }
-.al-progress::before {
-    content: ''; position: absolute; top: 0; bottom: 0; left: -45%; width: 45%;
-    border-radius: 3px;
-    background: linear-gradient(90deg, transparent, var(--accent, #7c3aed), transparent);
-    animation: al-slide 1.1s ease-in-out infinite;
-}
-@keyframes al-slide { 0% { left: -45%; } 100% { left: 100%; } }
-
-.al-spin { display: inline-block; animation: al-rot .7s linear infinite; }
-@keyframes al-rot { to { transform: rotate(360deg); } }
-#alSearchBtn[disabled] { opacity: .75; cursor: progress; }
-
-/* Skeleton shimmer for first-load placeholders. */
-.al-skel {
-    display: inline-block; height: 1em; min-width: 40px; width: 100%;
-    border-radius: 6px; vertical-align: middle;
-    background: linear-gradient(90deg,
-        rgba(255,255,255,.05) 25%,
-        rgba(255,255,255,.12) 37%,
-        rgba(255,255,255,.05) 63%);
-    background-size: 400% 100%;
-    animation: al-shimmer 1.3s ease infinite;
-}
-.stat-value .al-skel { height: 1.4em; max-width: 90px; }
-@keyframes al-shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
-
-@media (max-width: 1100px) {
-    .al-charts-grid { grid-template-columns: 1fr; }
-    .al-row, .al-row-3 { grid-template-columns: 1fr; }
-}
-</style>
-
+<% if (enabled) { %>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
 <script>
 window.__AL_I18N = {
-    purgeConfirm: <%- JSON.stringify(t('accessLogs.purgeConfirm') || 'Удалить все сохранённые access-логи? Это необратимо.') %>,
-    noResults: <%- JSON.stringify(t('accessLogs.noResults') || 'Ничего не найдено') %>,
-    never: <%- JSON.stringify(t('settings.never') || 'никогда') %>,
-    chRequired: <%- JSON.stringify(t('accessLogs.chRequired') || 'ClickHouse is required. Configure the connection in Settings.') %>,
-    noIps: <%- JSON.stringify(t('accessLogs.noIps') || 'Нет IP за выбранный период.') %>,
-    accepted: <%- JSON.stringify(t('accessLogs.stateActive') || 'accepted') %>,
+    locale: <%- alJson(typeof dateLocale !== 'undefined' ? dateLocale : lang) %>,
+    loading: <%- alJson(t('accessLogs.loading')) %>,
+    loaded: <%- alJson(t('accessLogs.loaded')) %>,
+    purgeConfirm: <%- alJson(t('accessLogs.purgeConfirm')) %>,
+    purgeSuccess: <%- alJson(t('accessLogs.purgeSuccess')) %>,
+    noSources: <%- alJson(t('accessLogs.noSources')) %>,
+    never: <%- alJson(t('settings.never')) %>,
+    chRequired: <%- alJson(t('accessLogs.chRequired')) %>,
+    searchErrorDescription: <%- alJson(t('accessLogs.searchErrorDescription')) %>,
+    analyticsErrorDescription: <%- alJson(t('accessLogs.analyticsErrorDescription')) %>,
+    partialAnalyticsWarning: <%- alJson(t('accessLogs.partialAnalyticsWarning')) %>,
+    purgeError: <%- alJson(t('accessLogs.purgeError')) %>,
+    sourceLoadError: <%- alJson(t('accessLogs.sourceLoadError')) %>,
+    invalidRange: <%- alJson(t('accessLogs.invalidRange')) %>,
+    showingEvents: <%- alJson(t('accessLogs.showingEvents')) %>,
+    rangeUntilNow: <%- alJson(t('accessLogs.rangeUntilNow')) %>,
+    rangeBetween: <%- alJson(t('accessLogs.rangeBetween')) %>,
+    activeFilter: <%- alJson(t('accessLogs.activeFilter')) %>,
+    removeFilter: <%- alJson(t('accessLogs.removeFilter')) %>,
+    timelineAria: <%- alJson(t('accessLogs.timelineAria')) %>,
+    timelineEmpty: <%- alJson(t('accessLogs.timelineEmpty')) %>,
+    chartUnavailable: <%- alJson(t('accessLogs.chartUnavailable')) %>,
+    userSourcesMeta: <%- alJson(t('accessLogs.userSourcesMeta')) %>,
+    breakdownAria: <%- alJson(t('accessLogs.breakdownAria')) %>,
+    pipelineSummary: <%- alJson(t('accessLogs.pipelineSummary')) %>,
+    spoolSummary: <%- alJson(t('accessLogs.spoolSummary')) %>,
+    unparsed: <%- alJson(t('accessLogs.unparsed')) %>,
     labels: {
-        accepted: 'accepted', rejected: 'rejected', blocked: 'blocked', tcp: 'tcp', udp: 'udp'
+        q: <%- alJson(t('accessLogs.filterQuery')) %>,
+        email: <%- alJson(t('accessLogs.filterUser')) %>,
+        destination: <%- alJson(t('accessLogs.filterDestination')) %>,
+        action: <%- alJson(t('accessLogs.filterAction')) %>,
+        nodeId: <%- alJson(t('accessLogs.filterNode')) %>,
+        sourceIp: <%- alJson(t('accessLogs.filterSource')) %>,
+        network: <%- alJson(t('accessLogs.filterProtocol')) %>,
+        accepted: <%- alJson(t('accessLogs.actionAccepted')) %>,
+        rejected: <%- alJson(t('accessLogs.actionRejected')) %>,
+        blocked: <%- alJson(t('accessLogs.actionBlocked')) %>,
+        tcp: 'TCP',
+        udp: 'UDP',
+        unknown: <%- alJson(t('common.unknown')) %>,
+        time: <%- alJson(t('accessLogs.colTime')) %>,
+        node: <%- alJson(t('accessLogs.filterNode')) %>,
+        user: <%- alJson(t('accessLogs.colUser')) %>,
+        source: <%- alJson(t('accessLogs.colSource')) %>,
+        destinationLabel: <%- alJson(t('accessLogs.colDest')) %>,
+        protocol: <%- alJson(t('accessLogs.colNet')) %>,
+        actionLabel: <%- alJson(t('accessLogs.colAction')) %>
+    },
+    statuses: {
+        disabled: <%- alJson(t('accessLogs.stateDisabled')) %>,
+        pending: <%- alJson(t('accessLogs.nodeStatePending')) %>,
+        active: <%- alJson(t('accessLogs.stateActive')) %>,
+        degraded: <%- alJson(t('accessLogs.nodeStateDegraded')) %>,
+        error: <%- alJson(t('accessLogs.stateError')) %>,
+        'agent-outdated': <%- alJson(t('accessLogs.nodeStateAgentOutdated')) %>,
+        'agent-missing': <%- alJson(t('accessLogs.nodeStateAgentMissing')) %>
     }
 };
-// Node id -> display name, so raw event rows show a readable node instead of a hash.
-window.__AL_NODES = <%- JSON.stringify((nodes || []).reduce((m, n) => { m[String(n._id)] = n.name; return m; }, {})) %>;
+window.__AL_NODES = <%- alJson(alNodeNames) %>;
 </script>
 <script defer src="/js/access-logs.js"></script>
+<% } %>

@@ -680,7 +680,7 @@
         try {
             const query = new URLSearchParams({
                 email: String(config.userId),
-                from: new Date(Date.now() - (7 * 24 * 60 * 60 * 1000)).toISOString(),
+                from: config.accessFrom || new Date(Date.now() - (7 * 24 * 60 * 60 * 1000)).toISOString(),
             }).toString();
             const [analytics, search] = await Promise.all([
                 getJson('/panel/access-logs/api/analytics?' + query),
@@ -690,11 +690,13 @@
             if (!analytics.enabled || !search.enabled) {
                 setAccessState('disabled');
                 accessLoaded = true;
+                announce(I18N.accessDisabledTitle);
                 return;
             }
             if (analytics.degraded || search.degraded || analytics.chRequired) {
                 setAccessState('degraded');
                 accessLoaded = true;
+                announce(I18N.accessDegradedTitle);
                 return;
             }
             if (analytics.error || search.error) {
@@ -707,7 +709,7 @@
             announce(I18N.accessLoaded);
         } catch (error) {
             setAccessState('error');
-            announce(I18N.error);
+            announce(I18N.accessErrorTitle || I18N.error);
         } finally {
             accessLoading = false;
         }
@@ -729,6 +731,13 @@
         const cell = document.createElement('td');
         if (className) cell.className = className;
         cell.textContent = text;
+        return cell;
+    }
+
+    function createEndpointCell(host, port, className) {
+        const endpoint = formatEndpoint(host, port);
+        const cell = createCell(endpoint, className);
+        cell.title = endpoint;
         return cell;
     }
 
@@ -758,9 +767,14 @@
             const row = document.createElement('tr');
             row.appendChild(createCell(formatEventTime(event.ts), 'user-event-time'));
             row.appendChild(createCell(formatNode(event.node_id), 'user-event-node'));
-            row.appendChild(createCell(formatEndpoint(event.source_ip, event.source_port), 'user-event-endpoint'));
-            row.appendChild(createCell(
-                formatEndpoint(event.dest_host || event.dest_ip, event.dest_port),
+            row.appendChild(createEndpointCell(
+                event.source_ip,
+                event.source_port,
+                'user-event-endpoint'
+            ));
+            row.appendChild(createEndpointCell(
+                event.dest_host || event.dest_ip,
+                event.dest_port,
                 'user-event-endpoint user-event-destination'
             ));
             const protocol = document.createElement('td');
